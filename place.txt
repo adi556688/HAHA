@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""
+Place a Cu atom relative to two cysteine sulfur atoms, that Cys 5x42 and Cys 5x43, and write a PDB coordinate tail to a text file.
+
+The reference Cu-S(cys5x42) distance and Cu-S(cys5x43) distance are from literature:
+    Haag, F., Ahmed, L., Reiss, K. et al. Copper-mediated thiol 
+    potentiation and mutagenesis-guided modeling suggest a highly 
+    conserved copper-binding motif in human OR2M3. 
+    Cell. Mol. Life Sci. 77, 2157–2179 (2020). https://doi.org/10.1007/s00018-019-03279-y
+More specifically, Figure 5e
+
+The first non-comment line of the output is only PDB columns 31-78:
+    x, y, z, occupancy, B-factor, and element
+
+Algorithm
+---------
+For fixed sulfur coordinates S1 and S2, the target Cu-S distances define two
+spheres. If the spheres intersect, their intersection is a circle (not a unique
+point). The script samples that circle and chooses the point in the least crowded
+local protein environment. If the spheres do not intersect, it reports the
+least-squares point minimizing
+
+    sqrt((|Cu-S1| - r1)^2 + (|Cu-S2| - r2)^2)
+
+and writes a warning that the fixed cysteine conformation cannot reproduce the
+reference geometry.
+
+Version: 3.0
+Dependencies: numpy, pandas, and an Excel reader supported by pandas (openpyxl).
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# =============================================================================
+# USER SETTINGS
+# =============================================================================
+EXCEL_PATH = Path(".xlsx")
+SHEET_NAME = "Residue table"
+PROTEIN = "OR2M3"
+
+PDB_PATH = Path(".pdb")
+CHAIN_ID = "A"
+MODEL_NUMBER = 1
+
+# "generic" uses GENERIC_CYS_POSITIONS and the Excel mapping.
+# "residue_numbers" bypasses Excel mapping and uses DIRECT_CYS_RESIDUES.
+SELECTION_MODE = "generic"
+
+# IMPORTANT FOR THE UPLOADED WORKBOOK:
+# residue_table_2.xlsx maps OR2M3 C202/C203 to 5x42/5x43.
+# The paper labels the same residues C202^5.41/C203^5.42.
+# Keep these settings consistent with the mapping table actually used.
+GENERIC_CYS_POSITIONS = ("5x42", "5x43")
+DIRECT_CYS_RESIDUES = (202, 203)
+
+# Match a cysteine sulfur atom using regex
+# such as SG. Examples matched: S, SG, SG1, 1SG. The PDB element is also
+# required to be sulfur, so this regex is only a flexible atom-name filter.
+CYSTEINE_SULFUR_ATOM_REGEX = r"^(?:\d+)?S[A-Za-z0-9]*$"
+
+# Different force fields may use CYS, CYM, CYX, CYN, CYS1, etc.
+# This is only a validation filter after generic-position/residue-number mapping.
+CYSTEINE_RESIDUE_NAME_REGEX = r"^(?:CYS[A-Za-z0-9]*|CYM|CYX|CYN)$"
+
+REFERENCE_DISTANCES_A = (2.33, 2.38)  # Cys1-S--Cu and Cys2-S--Cu, angstrom
+
+OUTPUT_PATH = Path("/mnt/data/OR2M3_site1_Cu_coordinate.txt")
+
+# PDB fields written after xyz.
+CU_OCCUPANCY = 1.00
+CU_B_FACTOR = 0.00
+CU_ELEMENT = "CU"
+
+# Circle sampling is used only when both target distances can be met exactly.
+N_CIRCLE_SAMPLES = 1440
+MIN_NONBOND_CLEARANCE_A = 1.70
+CROWDING_LENGTH_SCALE_A = 2.50
+CROWDING_CUTOFF_A = 8.00
+
+# Refuse accidental mapping to a non-cysteine by default.
+REQUIRE_CYSTEINE = True
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ResidueInfo:
+    generic_position: str
+    residue_label: str
+    residue_name_1: str
+    residue_number: int
+    segment: str
+
+
+@dataclass(frozen=True)
+class AtomRecord:
+    record_name: str
+    serial: int
+    atom_name: str
+    altloc: str
+    residue_name: str
+    chain_id: str
+    residue_number: int
+    insertion_code: str
+    coord: np.ndarray
+    occupancy: float
+    b_factor: float
+    element: str
+
+    @property
+    def identifier(self) -> str:
+        ins = self.insertion_code.strip()
+        resid = f"{self.residue_number}{ins}" if ins else str(self.residue_number)
+        alt = f" altloc={self.altloc}" if self.altloc else ""
+        return (
+            f"{self.record_name} serial={self.serial} {self.atom_name} "
+            f"{self.residue_name} chain={self.chain_id!r} resid={resid}{alt}"
+        )
+
+
+@dataclass(frozen=True)
+class PlacementResult:
+    coordinate: np.ndarray
+    distance_1: float
+    distance_2: float
+    residual_1: float
+    residual_2: float
+    objective: float
+    sulfur_distance: float
+    exact_geometry_possible: bool
+    method: str
+    steric_score: float
+
+
+def normalize_protein_name(name: str) -> str:
+    return re.sub(r"\s+Human$", "", str(name).strip(), flags=re.IGNORECASE)
+
+
+def find_protein_column(df: pd.DataFrame, protein: str) -> str:
+    protein_norm = protein.strip().lower()
+    candidates: List[str] = []
+    for col in df.columns:
+        col_str = str(col).strip()
+        col_norm = col_str.lower()
+        if col_norm == protein_norm or col_norm.startswith(protein_norm + " "):
+            return col_str
+        if col_norm.startswith(protein_norm):
+            candidates.append(col_str)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(f"Protein {protein!r} matched multiple columns: {candidates}")
+    raise ValueError(f"Protein {protein!r} not found in columns: {list(df.columns)}")
+
+
+def is_segment_label(value: object) -> bool:
+    text = str(value).strip()
+    if not text or text.lower() == "nan" or "x" in text:
+        return False
+    return bool(
+        re.fullmatch(
+            r"(TM\d+|ICL\d+|ECL\d+|N-term|C-term|H8|EL\d+|IL\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def parse_aa_and_resid(cell: object) -> Tuple[Optional[str], Optional[int]]:
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return None, None
+    text = str(cell).strip()
+    if text in {"", "-", "nan", "NaN"}:
+        return None, None
+
+    match = re.fullmatch(r"\s*([A-Za-z]+)?\s*(\d+)\s*", text)
+    if match:
+        aa_raw = match.group(1)
+        return (aa_raw[0].upper() if aa_raw else None), int(match.group(2))
+
+    number_match = re.search(r"(\d+)", text)
+    if not number_match:
+        return None, None
+    aa_match = re.search(r"([A-Za-z]+)", text)
+    aa = aa_match.group(1)[0].upper() if aa_match else None
+    return aa, int(number_match.group(1))
+
+
+def load_protein_mapping(
+    excel_path: Path,
+    sheet_name: str,
+    protein: str,
+) -> Tuple[str, Dict[str, ResidueInfo]]:
+    df = pd.read_excel(excel_path, sheet_name=sheet_name)
+    if "GPCRdb(A)" not in df.columns:
+        raise ValueError(
+            f"Column 'GPCRdb(A)' not found in {excel_path}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    protein_column = find_protein_column(df, protein)
+    mapping: Dict[str, ResidueInfo] = {}
+    current_segment = "UNKNOWN"
+
+    for _, row in df.iterrows():
+        generic_or_segment = row.get("GPCRdb(A)", None)
+        if is_segment_label(generic_or_segment):
+            current_segment = str(generic_or_segment).strip()
+            continue
+
+        generic = str(generic_or_segment).strip()
+        if not generic or generic.lower() == "nan" or "x" not in generic:
+            continue
+
+        aa, residue_number = parse_aa_and_resid(row.get(protein_column, None))
+        if residue_number is None:
+            continue
+        aa = aa or "X"
+        mapping[generic] = ResidueInfo(
+            generic_position=generic,
+            residue_label=f"{aa}{residue_number}",
+            residue_name_1=aa,
+            residue_number=residue_number,
+            segment=current_segment,
+        )
+
+    return protein_column, mapping
+
+
+def infer_element(atom_name: str, element_field: str) -> str:
+    element = element_field.strip().upper()
+    if element:
+        return element
+    cleaned = re.sub(r"[^A-Za-z]", "", atom_name).upper()
+    if not cleaned:
+        return ""
+    # Protein atom names beginning with H are hydrogens. Otherwise the first
+    # letter is enough for the heavy-atom filtering used here.
+    return cleaned[0]
+
+
+def parse_pdb_atoms(pdb_path: Path, model_number: int = 1) -> List[AtomRecord]:
+    atoms: List[AtomRecord] = []
+    current_model = 1
+    saw_model_record = False
+    selected_model_finished = False
+
+    with pdb_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            record = line[0:6].strip()
+            if record == "MODEL":
+                saw_model_record = True
+                try:
+                    current_model = int(line[10:14].strip())
+                except ValueError:
+                    current_model += 1
+                continue
+            if record == "ENDMDL":
+                if saw_model_record and current_model == model_number:
+                    selected_model_finished = True
+                if selected_model_finished:
+                    break
+                continue
+            if record not in {"ATOM", "HETATM"}:
+                continue
+            if saw_model_record and current_model != model_number:
+                continue
+
+            try:
+                atom = AtomRecord(
+                    record_name=record,
+                    serial=int(line[6:11]),
+                    atom_name=line[12:16].strip(),
+                    altloc=line[16:17].strip(),
+                    residue_name=line[17:20].strip(),
+                    chain_id=line[21:22].strip(),
+                    residue_number=int(line[22:26]),
+                    insertion_code=line[26:27].strip(),
+                    coord=np.array(
+                        [float(line[30:38]), float(line[38:46]), float(line[46:54])],
+                        dtype=float,
+                    ),
+                    occupancy=float(line[54:60].strip() or 0.0),
+                    b_factor=float(line[60:66].strip() or 0.0),
+                    element=infer_element(line[12:16], line[76:78] if len(line) >= 78 else ""),
+                )
+            except (ValueError, IndexError) as exc:
+                raise ValueError(f"Could not parse PDB atom line:\n{line.rstrip()}") from exc
+            atoms.append(atom)
+
+    if not atoms:
+        raise ValueError(f"No atoms were parsed from model {model_number} of {pdb_path}")
+    return atoms
+
+
+def select_unique_cysteine_sulfur_atom(
+    atoms: Sequence[AtomRecord],
+    chain_id: str,
+    residue_number: int,
+    atom_name_regex: str = CYSTEINE_SULFUR_ATOM_REGEX,
+) -> AtomRecord:
+    """Select the unique sulfur atom in a cysteine-like residue.
+
+    Selection does not assume the force-field-specific atom name ``SG``.
+    It requires both:
+      1. an inferred/declared PDB element of sulfur (``S``), and
+      2. an atom name matching ``atom_name_regex``.
+
+    Since cysteine has one sulfur atom, more than one match is treated as an
+    ambiguity rather than silently choosing one.
+    """
+    try:
+        name_pattern = re.compile(atom_name_regex, flags=re.IGNORECASE)
+    except re.error as exc:
+        raise ValueError(
+            f"Invalid CYSTEINE_SULFUR_ATOM_REGEX {atom_name_regex!r}: {exc}"
+        ) from exc
+
+    matches = [
+        atom
+        for atom in atoms
+        if atom.chain_id == chain_id
+        and atom.residue_number == residue_number
+        and atom.element.upper() == "S"
+        and name_pattern.fullmatch(atom.atom_name.strip()) is not None
+        and atom.altloc in {"", "A"}
+    ]
+    if not matches:
+        atoms_in_residue = [
+            atom
+            for atom in atoms
+            if atom.chain_id == chain_id
+            and atom.residue_number == residue_number
+            and atom.altloc in {"", "A"}
+        ]
+        available = ", ".join(
+            f"{atom.atom_name}(element={atom.element or '?'})"
+            for atom in atoms_in_residue
+        ) or "none"
+        raise ValueError(
+            f"No sulfur atom matching regex {atom_name_regex!r} was found for "
+            f"chain {chain_id!r}, residue {residue_number}. "
+            f"Available atoms: {available}"
+        )
+
+    # Prefer blank altloc over A if both are present.
+    matches.sort(key=lambda atom: (atom.altloc != "", atom.serial))
+    best = matches[0]
+    equivalent = [atom for atom in matches if atom.altloc == best.altloc]
+    if len(equivalent) > 1:
+        identifiers = "\n  ".join(atom.identifier for atom in equivalent)
+        raise ValueError(
+            "Multiple sulfur atoms matched in a residue expected to contain one:\n  "
+            + identifiers
+        )
+    return best
+
+
+def make_perpendicular_basis(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    unit_axis = axis / np.linalg.norm(axis)
+    candidates = np.eye(3)
+    seed = candidates[np.argmin(np.abs(candidates @ unit_axis))]
+    u = np.cross(unit_axis, seed)
+    u /= np.linalg.norm(u)
+    v = np.cross(unit_axis, u)
+    v /= np.linalg.norm(v)
+    return u, v
+
+
+def steric_score(candidate: np.ndarray, heavy_coords: np.ndarray) -> float:
+    if heavy_coords.size == 0:
+        return 0.0
+    distances = np.linalg.norm(heavy_coords - candidate, axis=1)
+    local = distances[distances <= CROWDING_CUTOFF_A]
+    if local.size == 0:
+        return 0.0
+
+    clash = np.maximum(0.0, MIN_NONBOND_CLEARANCE_A - local)
+    clash_penalty = 1.0e6 * float(np.sum(clash * clash))
+    crowding_penalty = float(
+        np.sum(np.exp(-0.5 * (local / CROWDING_LENGTH_SCALE_A) ** 2))
+    )
+    return clash_penalty + crowding_penalty
+
+
+def choose_open_point_on_intersection_circle(
+    sulfur_1: np.ndarray,
+    sulfur_2: np.ndarray,
+    radius_1: float,
+    radius_2: float,
+    heavy_coords: np.ndarray,
+) -> Tuple[np.ndarray, float, str]:
+    displacement = sulfur_2 - sulfur_1
+    sulfur_distance = float(np.linalg.norm(displacement))
+    axis = displacement / sulfur_distance
+
+    axial_distance = (
+        sulfur_distance * sulfur_distance + radius_1 * radius_1 - radius_2 * radius_2
+    ) / (2.0 * sulfur_distance)
+    circle_center = sulfur_1 + axial_distance * axis
+    circle_radius_sq = radius_1 * radius_1 - axial_distance * axial_distance
+    circle_radius = math.sqrt(max(0.0, circle_radius_sq))
+
+    if circle_radius < 1.0e-10:
+        return circle_center, steric_score(circle_center, heavy_coords), "tangent spheres"
+
+    u, v = make_perpendicular_basis(axis)
+    best_coord: Optional[np.ndarray] = None
+    best_score = math.inf
+    best_theta = 0.0
+
+    for index in range(N_CIRCLE_SAMPLES):
+        theta = 2.0 * math.pi * index / N_CIRCLE_SAMPLES
+        candidate = circle_center + circle_radius * (
+            math.cos(theta) * u + math.sin(theta) * v
+        )
+        score = steric_score(candidate, heavy_coords)
+        if score < best_score:
+            best_score = score
+            best_coord = candidate
+            best_theta = theta
+
+    assert best_coord is not None
+
+    # Small deterministic local refinement around the best sampled angle.
+    step = 2.0 * math.pi / N_CIRCLE_SAMPLES
+    left = best_theta - step
+    right = best_theta + step
+    golden = (math.sqrt(5.0) - 1.0) / 2.0
+    x1 = right - golden * (right - left)
+    x2 = left + golden * (right - left)
+
+    def candidate_at(theta: float) -> np.ndarray:
+        return circle_center + circle_radius * (
+            math.cos(theta) * u + math.sin(theta) * v
+        )
+
+    f1 = steric_score(candidate_at(x1), heavy_coords)
+    f2 = steric_score(candidate_at(x2), heavy_coords)
+    for _ in range(60):
+        if f1 <= f2:
+            right = x2
+            x2 = x1
+            f2 = f1
+            x1 = right - golden * (right - left)
+            f1 = steric_score(candidate_at(x1), heavy_coords)
+        else:
+            left = x1
+            x1 = x2
+            f1 = f2
+            x2 = left + golden * (right - left)
+            f2 = steric_score(candidate_at(x2), heavy_coords)
+
+    theta = 0.5 * (left + right)
+    refined = candidate_at(theta)
+    refined_score = steric_score(refined, heavy_coords)
+    return refined, refined_score, "sphere-intersection circle + open-space tie-breaker"
+
+
+def least_squares_axis_point(
+    sulfur_1: np.ndarray,
+    sulfur_2: np.ndarray,
+    radius_1: float,
+    radius_2: float,
+) -> np.ndarray:
+    """Return the global fixed-sulfur distance least-squares solution when spheres do not intersect."""
+    displacement = sulfur_2 - sulfur_1
+    sulfur_distance = float(np.linalg.norm(displacement))
+    if sulfur_distance < 1.0e-12:
+        # Coincident sulfur atoms: any direction is equivalent. Use +x and the
+        # average radius, which equalizes the two residuals.
+        return sulfur_1 + np.array([(radius_1 + radius_2) / 2.0, 0.0, 0.0])
+
+    axis = displacement / sulfur_distance
+
+    # Evaluate the stationary point in each of the three 1D regions along the
+    # sulfur-sulfur axis, plus the two region boundaries. This is robust for
+    # disjoint spheres and for one sphere lying inside the other.
+    candidate_t = {
+        0.0,
+        sulfur_distance,
+        min(sulfur_distance, max(0.0, (sulfur_distance + radius_1 - radius_2) / 2.0)),
+        (sulfur_distance + radius_1 + radius_2) / 2.0,
+        (sulfur_distance - radius_1 - radius_2) / 2.0,
+    }
+
+    best_point: Optional[np.ndarray] = None
+    best_objective = math.inf
+    for t in candidate_t:
+        point = sulfur_1 + t * axis
+        d1 = float(np.linalg.norm(point - sulfur_1))
+        d2 = float(np.linalg.norm(point - sulfur_2))
+        objective = math.hypot(d1 - radius_1, d2 - radius_2)
+        if objective < best_objective:
+            best_objective = objective
+            best_point = point
+
+    assert best_point is not None
+    return best_point
+
+
+def place_copper(
+    sulfur_1: np.ndarray,
+    sulfur_2: np.ndarray,
+    radius_1: float,
+    radius_2: float,
+    heavy_coords: np.ndarray,
+) -> PlacementResult:
+    sulfur_distance = float(np.linalg.norm(sulfur_2 - sulfur_1))
+    lower_limit = abs(radius_1 - radius_2)
+    upper_limit = radius_1 + radius_2
+    tolerance = 1.0e-10
+    exact_possible = lower_limit - tolerance <= sulfur_distance <= upper_limit + tolerance
+
+    if exact_possible and sulfur_distance > tolerance:
+        coordinate, score, method = choose_open_point_on_intersection_circle(
+            sulfur_1,
+            sulfur_2,
+            radius_1,
+            radius_2,
+            heavy_coords,
+        )
+    else:
+        coordinate = least_squares_axis_point(sulfur_1, sulfur_2, radius_1, radius_2)
+        score = steric_score(coordinate, heavy_coords)
+        method = "fixed-sulfur global distance least-squares point on sulfur-sulfur axis"
+
+    distance_1 = float(np.linalg.norm(coordinate - sulfur_1))
+    distance_2 = float(np.linalg.norm(coordinate - sulfur_2))
+    residual_1 = distance_1 - radius_1
+    residual_2 = distance_2 - radius_2
+    objective = math.hypot(residual_1, residual_2)
+
+    return PlacementResult(
+        coordinate=coordinate,
+        distance_1=distance_1,
+        distance_2=distance_2,
+        residual_1=residual_1,
+        residual_2=residual_2,
+        objective=objective,
+        sulfur_distance=sulfur_distance,
+        exact_geometry_possible=exact_possible,
+        method=method,
+        steric_score=score,
+    )
+
+
+def pdb_coordinate_tail(
+    coordinate: np.ndarray,
+    occupancy: float,
+    b_factor: float,
+    element: str,
+) -> str:
+    x, y, z = coordinate
+    # PDB columns 31-78: xyz (8.3 each), occupancy (6.2), B-factor (6.2),
+    # ten blanks, then right-aligned element (2).
+    return (
+        f"{x:8.3f}{y:8.3f}{z:8.3f}"
+        f"{occupancy:6.2f}{b_factor:6.2f}"
+        f"          {element:>2s}"
+    )
+
+
+def nearest_noncoordinating_atom(
+    coordinate: np.ndarray,
+    atoms: Iterable[AtomRecord],
+    excluded_serials: set[int],
+) -> Tuple[Optional[AtomRecord], float]:
+    best_atom: Optional[AtomRecord] = None
+    best_distance = math.inf
+    for atom in atoms:
+        if atom.serial in excluded_serials or atom.element in {"H", "D"}:
+            continue
+        distance = float(np.linalg.norm(atom.coord - coordinate))
+        if distance < best_distance:
+            best_distance = distance
+            best_atom = atom
+    return best_atom, best_distance
+
+
+def write_output(
+    output_path: Path,
+    protein_column: str,
+    residue_1: ResidueInfo,
+    residue_2: ResidueInfo,
+    sulfur_atom_1: AtomRecord,
+    sulfur_atom_2: AtomRecord,
+    result: PlacementResult,
+    nearest_atom: Optional[AtomRecord],
+    nearest_distance: float,
+) -> None:
+    radius_1, radius_2 = REFERENCE_DISTANCES_A
+    lower_limit = abs(radius_1 - radius_2)
+    upper_limit = radius_1 + radius_2
+    tail = pdb_coordinate_tail(
+        result.coordinate,
+        occupancy=CU_OCCUPANCY,
+        b_factor=CU_B_FACTOR,
+        element=CU_ELEMENT,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        # The requested copy/paste line comes first.
+        handle.write(tail + "\n")
+        handle.write("# PDB coordinate tail above is columns 31-78 only.\n")
+        handle.write("# Prepend/edit HETATM, serial, atom name, residue name, chain, and residue ID as needed.\n")
+        handle.write(f"# Protein mapping column: {protein_column}\n")
+        handle.write(f"# Input PDB: {PDB_PATH}\n")
+        handle.write(f"# Chain/model: {CHAIN_ID!r} / {MODEL_NUMBER}\n")
+        handle.write(
+            f"# Cysteine sulfur atom-name regex: {CYSTEINE_SULFUR_ATOM_REGEX!r}\n"
+        )
+        handle.write(
+            f"# Cys 1: {residue_1.generic_position} -> {residue_1.residue_label} "
+            f"({residue_1.segment}); {sulfur_atom_1.identifier}; "
+            f"sulfur xyz = {sulfur_atom_1.coord[0]:.6f} {sulfur_atom_1.coord[1]:.6f} {sulfur_atom_1.coord[2]:.6f}\n"
+        )
+        handle.write(
+            f"# Cys 2: {residue_2.generic_position} -> {residue_2.residue_label} "
+            f"({residue_2.segment}); {sulfur_atom_2.identifier}; "
+            f"sulfur xyz = {sulfur_atom_2.coord[0]:.6f} {sulfur_atom_2.coord[1]:.6f} {sulfur_atom_2.coord[2]:.6f}\n"
+        )
+        handle.write(f"# Reference Cu-S distances (angstrom): {radius_1:.6f} {radius_2:.6f}\n")
+        handle.write(
+            f"# Computed Cu-S distances (angstrom): {result.distance_1:.6f} {result.distance_2:.6f}\n"
+        )
+        handle.write(
+            f"# Distance residuals computed-reference (angstrom): "
+            f"{result.residual_1:.6f} {result.residual_2:.6f}\n"
+        )
+        handle.write(
+            "# Optimization value sqrt((d1-r1)^2 + (d2-r2)^2) (angstrom): "
+            f"{result.objective:.6f}\n"
+        )
+        handle.write(f"# Cys sulfur-sulfur distance (angstrom): {result.sulfur_distance:.6f}\n")
+        handle.write(
+            f"# Exact two-distance geometry possible with fixed sulfur atoms: "
+            f"{'YES' if result.exact_geometry_possible else 'NO'}\n"
+        )
+        handle.write(
+            f"# Exact sphere-intersection condition: {lower_limit:.6f} <= sulfur-sulfur <= {upper_limit:.6f} angstrom\n"
+        )
+        handle.write(f"# Placement method: {result.method}\n")
+        handle.write(f"# Steric/crowding diagnostic score (not part of the reported distance objective): {result.steric_score:.6f}\n")
+        if nearest_atom is not None:
+            handle.write(
+                f"# Nearest non-coordinating heavy atom: {nearest_atom.identifier}; "
+                f"distance = {nearest_distance:.6f} angstrom\n"
+            )
+            if nearest_distance < MIN_NONBOND_CLEARANCE_A:
+                handle.write(
+                    f"# WARNING: nearest-heavy-atom distance is below the configured "
+                    f"{MIN_NONBOND_CLEARANCE_A:.2f} angstrom clearance.\n"
+                )
+        if not result.exact_geometry_possible:
+            if result.sulfur_distance > upper_limit:
+                gap = result.sulfur_distance - upper_limit
+                handle.write(
+                    f"# WARNING: sulfur atoms are {gap:.6f} angstrom farther apart than the maximum "
+                    "distance compatible with both reference Cu-S distances.\n"
+                )
+            else:
+                gap = lower_limit - result.sulfur_distance
+                handle.write(
+                    f"# WARNING: sulfur atoms are {gap:.6f} angstrom too close for the two unequal "
+                    "reference Cu-S distances.\n"
+                )
+            handle.write(
+                "# The coordinate is therefore a mathematical least-squares compromise, not a "
+                "chemically validated Cu(I) site. Side-chain/ligand refinement is required.\n"
+            )
+
+
+def main() -> None:
+    if not PDB_PATH.exists():
+        raise FileNotFoundError(f"PDB file not found: {PDB_PATH}")
+    if SELECTION_MODE not in {"generic", "residue_numbers"}:
+        raise ValueError("SELECTION_MODE must be 'generic' or 'residue_numbers'.")
+
+    if SELECTION_MODE == "generic":
+        if not EXCEL_PATH.exists():
+            raise FileNotFoundError(f"Excel mapping file not found: {EXCEL_PATH}")
+        protein_column, mapping = load_protein_mapping(EXCEL_PATH, SHEET_NAME, PROTEIN)
+        missing = [position for position in GENERIC_CYS_POSITIONS if position not in mapping]
+        if missing:
+            raise KeyError(f"Missing generic positions for {protein_column}: {missing}")
+        residue_1 = mapping[GENERIC_CYS_POSITIONS[0]]
+        residue_2 = mapping[GENERIC_CYS_POSITIONS[1]]
+    else:
+        protein_column = f"{PROTEIN} (direct residue-number mode)"
+        residue_1 = ResidueInfo("DIRECT_1", f"C{DIRECT_CYS_RESIDUES[0]}", "C", DIRECT_CYS_RESIDUES[0], "UNKNOWN")
+        residue_2 = ResidueInfo("DIRECT_2", f"C{DIRECT_CYS_RESIDUES[1]}", "C", DIRECT_CYS_RESIDUES[1], "UNKNOWN")
+
+    if REQUIRE_CYSTEINE:
+        for residue in (residue_1, residue_2):
+            if residue.residue_name_1 != "C":
+                raise ValueError(
+                    f"{residue.generic_position} maps to {residue.residue_label}, not cysteine. "
+                    "Check the numbering convention and GENERIC_CYS_POSITIONS."
+                )
+
+    atoms = parse_pdb_atoms(PDB_PATH, model_number=MODEL_NUMBER)
+    sulfur_atom_1 = select_unique_cysteine_sulfur_atom(
+        atoms, CHAIN_ID, residue_1.residue_number
+    )
+    sulfur_atom_2 = select_unique_cysteine_sulfur_atom(
+        atoms, CHAIN_ID, residue_2.residue_number
+    )
+
+    if REQUIRE_CYSTEINE:
+        try:
+            cysteine_resname_pattern = re.compile(
+                CYSTEINE_RESIDUE_NAME_REGEX, flags=re.IGNORECASE
+            )
+        except re.error as exc:
+            raise ValueError(
+                f"Invalid CYSTEINE_RESIDUE_NAME_REGEX "
+                f"{CYSTEINE_RESIDUE_NAME_REGEX!r}: {exc}"
+            ) from exc
+
+        for residue, sulfur_atom in (
+            (residue_1, sulfur_atom_1),
+            (residue_2, sulfur_atom_2),
+        ):
+            if cysteine_resname_pattern.fullmatch(sulfur_atom.residue_name) is None:
+                raise ValueError(
+                    f"Mapped {residue.generic_position}/{residue.residue_label}, but the "
+                    f"PDB sulfur is in residue {sulfur_atom.residue_name!r}, which does "
+                    f"not match CYSTEINE_RESIDUE_NAME_REGEX="
+                    f"{CYSTEINE_RESIDUE_NAME_REGEX!r}. Check residue numbering or "
+                    "adjust the residue-name regex for the force field."
+                )
+
+    excluded_serials = {sulfur_atom_1.serial, sulfur_atom_2.serial}
+    heavy_atoms = [
+        atom
+        for atom in atoms
+        if atom.serial not in excluded_serials and atom.element not in {"H", "D"}
+    ]
+    heavy_coords = np.array([atom.coord for atom in heavy_atoms], dtype=float)
+
+    result = place_copper(
+        sulfur_atom_1.coord,
+        sulfur_atom_2.coord,
+        REFERENCE_DISTANCES_A[0],
+        REFERENCE_DISTANCES_A[1],
+        heavy_coords,
+    )
+    nearest_atom, nearest_distance = nearest_noncoordinating_atom(
+        result.coordinate, atoms, excluded_serials
+    )
+    write_output(
+        OUTPUT_PATH,
+        protein_column,
+        residue_1,
+        residue_2,
+        sulfur_atom_1,
+        sulfur_atom_2,
+        result,
+        nearest_atom,
+        nearest_distance,
+    )
+
+    print(f"Wrote {OUTPUT_PATH}")
+    print(f"Cu coordinate: {result.coordinate[0]:.6f} {result.coordinate[1]:.6f} {result.coordinate[2]:.6f}")
+    print(f"Computed distances: {result.distance_1:.6f} {result.distance_2:.6f} angstrom")
+    print(f"Optimization value: {result.objective:.6f} angstrom")
+    print(f"Exact fixed-sulfur geometry possible: {result.exact_geometry_possible}")
+
+
+if __name__ == "__main__":
+    main()
