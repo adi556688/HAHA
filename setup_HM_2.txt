@@ -1,0 +1,325 @@
+#!/bin/bash
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+# Directory where this wrapper script is launched
+WORK_DIR="$(pwd)"
+
+# File containing one protein name per line
+FAMILY_LIST="${WORK_DIR}/family_list.txt"
+
+# Directory where protein folders are located
+OUTPUT_DIR="${WORK_DIR}/family_models"
+
+# Maximum number of active jobs from this workflow
+# Active = RUN + PEND
+MAX_ACTIVE=2
+
+# How often to check LSF
+CHECK_INTERVAL=30
+
+# Prefix used to identify jobs submitted by this workflow
+JOB_PREFIX="ORGRID_"
+
+# Schrodinger container
+CONTAINER=""
+
+
+# ============================================================
+# CHECK INPUT FILES / DIRECTORIES
+# ============================================================
+
+if [[ ! -f "$FAMILY_LIST" ]]; then
+    echo "ERROR: Family list not found:"
+    echo "$FAMILY_LIST"
+    exit 1
+fi
+
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Protein directory not found:"
+    echo "$OUTPUT_DIR"
+    exit 1
+fi
+
+
+# ============================================================
+# FUNCTION: COUNT ACTIVE JOBS
+# ============================================================
+
+count_active_jobs() {
+
+    bjobs -noheader -o "stat job_name" 2>/dev/null |
+        awk -v prefix="$JOB_PREFIX" '
+            ($1 == "RUN" || $1 == "PEND") &&
+            index($2, prefix) == 1 {
+                count++
+            }
+            END {
+                print count+0
+            }
+        '
+}
+
+
+# ============================================================
+# FUNCTION: DISPLAY CURRENT WORKFLOW JOBS
+# ============================================================
+
+show_active_jobs() {
+
+    echo
+    echo "Current ${JOB_PREFIX} jobs:"
+    echo "----------------------------------------"
+
+    bjobs -noheader -o "jobid stat job_name" 2>/dev/null |
+        awk -v prefix="$JOB_PREFIX" '
+            ($2 == "RUN" || $2 == "PEND") &&
+            index($3, prefix) == 1 {
+                print
+            }
+        '
+
+    echo "----------------------------------------"
+}
+
+
+# ============================================================
+# FUNCTION: WAIT FOR AVAILABLE SLOT
+# ============================================================
+
+wait_for_slot() {
+
+    while true
+    do
+        active_jobs=$(count_active_jobs)
+
+        echo
+        echo "Active jobs (RUN + PEND): ${active_jobs}/${MAX_ACTIVE}"
+
+        if (( active_jobs < MAX_ACTIVE )); then
+            echo "A submission slot is available."
+            break
+        fi
+
+        show_active_jobs
+
+        echo
+        echo "Maximum number of active jobs reached."
+        echo "Waiting ${CHECK_INTERVAL} seconds..."
+        echo
+
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+while IFS= read -r protein
+do
+
+    # --------------------------------------------------------
+    # Remove Windows carriage return if needed
+    # --------------------------------------------------------
+
+    protein="${protein//$'\r'/}"
+
+
+    # --------------------------------------------------------
+    # Skip empty lines
+    # --------------------------------------------------------
+
+    [[ -z "$protein" ]] && continue
+
+
+    # --------------------------------------------------------
+    # Skip comment lines
+    # --------------------------------------------------------
+
+    [[ "$protein" == \#* ]] && continue
+
+
+    echo
+    echo "============================================================"
+    echo "Processing protein: $protein"
+    echo "============================================================"
+
+
+    # --------------------------------------------------------
+    # Define protein directory
+    # --------------------------------------------------------
+
+    PROTEIN_DIR="${OUTPUT_DIR}/${protein}"
+
+
+    # --------------------------------------------------------
+    # Check protein directory exists
+    # --------------------------------------------------------
+
+    if [[ ! -d "$PROTEIN_DIR" ]]; then
+        echo "WARNING: Protein directory does not exist:"
+        echo "$PROTEIN_DIR"
+        echo "Skipping $protein."
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # Wait until fewer than MAX_ACTIVE jobs exist
+    # --------------------------------------------------------
+
+    wait_for_slot
+
+
+    # --------------------------------------------------------
+    # Enter protein directory
+    # --------------------------------------------------------
+
+    cd "$PROTEIN_DIR" || {
+        echo "ERROR: Could not enter:"
+        echo "$PROTEIN_DIR"
+        exit 1
+    }
+
+
+    # --------------------------------------------------------
+    # Find .sh job file
+    # --------------------------------------------------------
+
+    sh_files=( *.sh )
+
+    if [[ ! -e "${sh_files[0]}" ]]; then
+
+        echo "WARNING: No .sh file found in:"
+        echo "$PROTEIN_DIR"
+        echo "Skipping $protein."
+
+        cd "$WORK_DIR" || exit 1
+
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # Require exactly one .sh file
+    # --------------------------------------------------------
+
+    if (( ${#sh_files[@]} > 1 )); then
+
+        echo "ERROR: Multiple .sh files found in:"
+        echo "$PROTEIN_DIR"
+
+        printf '  %s\n' "${sh_files[@]}"
+
+        echo
+        echo "Please keep only one submission script"
+        echo "inside each protein folder."
+
+        cd "$WORK_DIR" || exit 1
+
+        exit 1
+    fi
+
+
+    JOB_SCRIPT="${sh_files[0]}"
+
+    JOB_NAME="${JOB_PREFIX}${protein}"
+
+
+    # --------------------------------------------------------
+    # Display submission information
+    # --------------------------------------------------------
+
+    echo
+    echo "Submitting job:"
+    echo "  Protein    : $protein"
+    echo "  Directory  : $PROTEIN_DIR"
+    echo "  Script     : $JOB_SCRIPT"
+    echo "  Job name   : $JOB_NAME"
+    echo
+
+
+    # --------------------------------------------------------
+    # Submit job
+    # --------------------------------------------------------
+
+    lsfcontainer \
+        -W 01:00 \
+        -J "$JOB_NAME" \
+        -n 1 \
+        -q standard \
+        -gpu 1 \
+        -G corp \
+        -i "$CONTAINER" \
+        "$PWD/$JOB_SCRIPT"
+
+
+    # --------------------------------------------------------
+    # Capture submission return code
+    # --------------------------------------------------------
+
+    submit_status=$?
+
+
+    if (( submit_status != 0 )); then
+
+        echo
+        echo "ERROR: Submission failed for:"
+        echo "$protein"
+        echo "Return code: $submit_status"
+
+        cd "$WORK_DIR" || exit 1
+
+        exit 1
+    fi
+
+
+    echo
+    echo "Submission successful: $protein"
+
+
+    # --------------------------------------------------------
+    # Return to main working directory
+    # --------------------------------------------------------
+
+    cd "$WORK_DIR" || exit 1
+
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Wait for LSF to register the submitted job before
+    # checking/submitting another one.
+    # --------------------------------------------------------
+
+    sleep 10
+
+
+    # --------------------------------------------------------
+    # Verify current count after submission
+    # --------------------------------------------------------
+
+    active_jobs=$(count_active_jobs)
+
+    echo
+    echo "Active jobs after submission: ${active_jobs}/${MAX_ACTIVE}"
+
+    show_active_jobs
+
+
+done < "$FAMILY_LIST"
+
+
+# ============================================================
+# FINISHED
+# ============================================================
+
+echo
+echo "============================================================"
+echo "ALL PROTEINS HAVE BEEN SUBMITTED"
+echo "============================================================"
+echo
