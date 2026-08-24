@@ -1,0 +1,239 @@
+#!/bin/bash
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+# Working directory where this script is launched
+WORK_DIR="$(pwd)"
+
+# File containing one protein name per line
+FAMILY_LIST="${WORK_DIR}/family_list.txt"
+
+# Directory containing the protein folders
+OUTPUT_DIR="${WORK_DIR}/family_models"
+
+# Maximum number of RUNNING jobs from this workflow
+MAX_RUNNING=2
+
+# How often to check LSF job status, in seconds
+CHECK_INTERVAL=30
+
+# Prefix used to identify jobs submitted by THIS script
+JOB_PREFIX="ORGRID_"
+
+CONTAINER=""
+
+
+# ============================================================
+# CHECK INPUTS
+# ============================================================
+
+if [[ ! -f "$FAMILY_LIST" ]]; then
+    echo "ERROR: Family list not found:"
+    echo "$FAMILY_LIST"
+    exit 1
+fi
+
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Output directory not found:"
+    echo "$OUTPUT_DIR"
+    exit 1
+fi
+
+
+# ============================================================
+# FUNCTION: COUNT RUNNING JOBS
+# ============================================================
+
+count_running_jobs() {
+
+    bjobs -noheader -o "stat job_name" 2>/dev/null |
+        awk '$1 == "RUN" {print $2}' |
+        grep -c "^${JOB_PREFIX}" || true
+}
+
+
+# ============================================================
+# FUNCTION: WAIT FOR AVAILABLE SLOT
+# ============================================================
+
+wait_for_slot() {
+
+    while true
+    do
+        running_jobs=$(count_running_jobs)
+
+        echo "Currently running ${JOB_PREFIX} jobs: ${running_jobs}/${MAX_RUNNING}"
+
+        if (( running_jobs < MAX_RUNNING )); then
+            break
+        fi
+
+        echo "Maximum number of running jobs reached."
+        echo "Checking again in ${CHECK_INTERVAL} seconds..."
+        echo
+
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+
+# ============================================================
+# MAIN LOOP THROUGH PROTEINS
+# ============================================================
+
+while IFS= read -r protein
+do
+
+    # --------------------------------------------------------
+    # Clean Windows carriage returns if list was made on Windows
+    # --------------------------------------------------------
+
+    protein="${protein//$'\r'/}"
+
+
+    # --------------------------------------------------------
+    # Skip empty lines
+    # --------------------------------------------------------
+
+    [[ -z "$protein" ]] && continue
+
+
+    # --------------------------------------------------------
+    # Skip comment lines beginning with #
+    # --------------------------------------------------------
+
+    [[ "$protein" == \#* ]] && continue
+
+
+    echo
+    echo "============================================================"
+    echo "Processing: $protein"
+    echo "============================================================"
+
+
+    # --------------------------------------------------------
+    # Define protein directory
+    # --------------------------------------------------------
+
+    PROTEIN_DIR="${OUTPUT_DIR}/${protein}"
+
+
+    # --------------------------------------------------------
+    # Check protein directory
+    # --------------------------------------------------------
+
+    if [[ ! -d "$PROTEIN_DIR" ]]; then
+        echo "WARNING: Protein directory does not exist:"
+        echo "$PROTEIN_DIR"
+        echo "Skipping $protein"
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # Wait until fewer than 2 jobs are RUNNING
+    # --------------------------------------------------------
+
+    wait_for_slot
+
+
+    # --------------------------------------------------------
+    # Enter protein directory
+    # --------------------------------------------------------
+
+    cd "$PROTEIN_DIR" || {
+        echo "ERROR: Could not enter:"
+        echo "$PROTEIN_DIR"
+        exit 1
+    }
+
+
+    # --------------------------------------------------------
+    # Find shell script
+    # --------------------------------------------------------
+
+    sh_files=( *.sh )
+
+    if [[ ! -e "${sh_files[0]}" ]]; then
+        echo "WARNING: No .sh file found in:"
+        echo "$PROTEIN_DIR"
+        echo "Skipping $protein"
+
+        cd "$WORK_DIR" || exit 1
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # Require exactly one .sh file
+    # --------------------------------------------------------
+
+    if (( ${#sh_files[@]} > 1 )); then
+        echo "ERROR: More than one .sh file found in:"
+        echo "$PROTEIN_DIR"
+
+        printf '  %s\n' "${sh_files[@]}"
+
+        echo "Please make sure each protein folder contains only one job script."
+
+        cd "$WORK_DIR" || exit 1
+        exit 1
+    fi
+
+
+    JOB_SCRIPT="${sh_files[0]}"
+
+    echo "Job script: $JOB_SCRIPT"
+
+
+    # --------------------------------------------------------
+    # Submit job
+    # --------------------------------------------------------
+
+    JOB_NAME="${JOB_PREFIX}${protein}"
+
+    echo "Submitting:"
+    echo "  Protein  : $protein"
+    echo "  Job name : $JOB_NAME"
+    echo
+
+
+    lsfcontainer \
+        -W 01:00 \
+        -J "$JOB_NAME" \
+        -n 1 \
+        -q standard \
+        -gpu 1 \
+        -G corp \
+        -i "$CONTAINER" \
+        "$PWD/$JOB_SCRIPT"
+
+
+    # --------------------------------------------------------
+    # Return to working directory
+    # --------------------------------------------------------
+
+    cd "$WORK_DIR" || exit 1
+
+
+    # --------------------------------------------------------
+    # Give LSF time to register submitted job
+    # --------------------------------------------------------
+
+    sleep 5
+
+
+done < "$FAMILY_LIST"
+
+
+# ============================================================
+# FINISHED SUBMITTING
+# ============================================================
+
+echo
+echo "============================================================"
+echo "ALL JOBS HAVE BEEN SUBMITTED"
+echo "============================================================"
