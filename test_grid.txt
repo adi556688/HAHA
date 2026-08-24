@@ -1,0 +1,583 @@
+import os
+import re
+import shutil
+import pandas as pd
+from pathlib import Path
+
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+ONE_TO_THREE = {
+    "A": "ALA",
+    "R": "ARG",
+    "N": "ASN",
+    "D": "ASP",
+    "C": "CYS",
+    "E": "GLU",
+    "Q": "GLN",
+    "G": "GLY",
+    "H": "HIS",
+    "I": "ILE",
+    "L": "LEU",
+    "K": "LYS",
+    "M": "MET",
+    "F": "PHE",
+    "P": "PRO",
+    "S": "SER",
+    "T": "THR",
+    "W": "TRP",
+    "Y": "TYR",
+    "V": "VAL",
+}
+
+
+# Atom to use for the hydrogen-bond constraint
+HBOND_ATOMS = {
+    "ARG": "HH21",
+    "HIS": "HE2",
+}
+
+
+def get_protein_from_folder(folder):
+    """
+    Example:
+        C:/project/OR51A2 -> OR51A2
+        /x/x/x/OR51B4    -> OR51B4
+    """
+    folder = os.path.normpath(folder)
+    return os.path.basename(folder)
+
+
+def find_protein_column(df, protein):
+    """
+    Finds the Excel column corresponding to the protein.
+
+    Examples:
+        protein = OR51B4
+
+    Can match:
+        OR51B4
+        OR51B4 Human
+        OR51B4_Human
+    """
+    protein_upper = protein.upper()
+
+    # First try exact match
+    for col in df.columns:
+        if str(col).strip().upper() == protein_upper:
+            return col
+
+    # Then try columns beginning with protein name
+    candidates = []
+
+    for col in df.columns:
+        col_upper = str(col).strip().upper()
+
+        if col_upper.startswith(protein_upper):
+            candidates.append(col)
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Multiple Excel columns matched protein {protein}:\n"
+            f"{candidates}"
+        )
+
+    raise ValueError(
+        f"Could not find protein {protein} in residue table."
+    )
+
+
+def parse_residue(cell):
+    """
+    Convert:
+        R260 -> ('R', 260)
+        H262 -> ('H', 262)
+        F27  -> ('F', 27)
+    """
+
+    if pd.isna(cell):
+        return None, None
+
+    text = str(cell).strip()
+
+    match = re.match(r"([A-Za-z])\s*(\d+)", text)
+
+    if not match:
+        return None, None
+
+    aa = match.group(1).upper()
+    resid = int(match.group(2))
+
+    return aa, resid
+
+
+def get_residue_from_generic(
+    excel_file,
+    protein,
+    generic_position,
+    sheet_name="Residue table",
+    generic_column="GPCRdb(A)"
+):
+    """
+    Find residue corresponding to a generic position.
+
+    Example:
+
+        OR51B4 + 6x59 -> R260
+
+    Returns:
+        aa_1letter
+        resname_3letter
+        resid
+    """
+
+    df = pd.read_excel(
+        excel_file,
+        sheet_name=sheet_name
+    )
+
+    protein_col = find_protein_column(df, protein)
+
+    # Normalize generic-position strings
+    generic_values = (
+        df[generic_column]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    target = generic_position.strip().lower()
+
+    matches = df[generic_values == target]
+
+    if len(matches) == 0:
+        raise ValueError(
+            f"Generic position {generic_position} "
+            f"was not found in column {generic_column}."
+        )
+
+    if len(matches) > 1:
+        print(
+            f"WARNING: generic position {generic_position} "
+            f"appeared more than once. Using first occurrence."
+        )
+
+    residue_cell = matches.iloc[0][protein_col]
+
+    aa, resid = parse_residue(residue_cell)
+
+    if aa is None:
+        raise ValueError(
+            f"{protein} does not have a residue assignment "
+            f"for generic position {generic_position}.\n"
+            f"Excel value = {residue_cell}"
+        )
+
+    if aa not in ONE_TO_THREE:
+        raise ValueError(
+            f"Unknown amino-acid code: {aa}"
+        )
+
+    resname = ONE_TO_THREE[aa]
+
+    return aa, resname, resid
+
+
+def get_hbond_atom(resname):
+    """
+    Hard-coded hydrogen-bond atoms.
+
+    ARG -> HH21
+    HIS -> HE2
+    """
+
+    if resname not in HBOND_ATOMS:
+        raise ValueError(
+            f"No HBOND atom has been defined for {resname}.\n"
+            f"Currently supported: {HBOND_ATOMS}"
+        )
+
+    return HBOND_ATOMS[resname]
+
+
+def find_atom_id_in_mae(
+    mae_file,
+    resname,
+    resid,
+    atomname,
+    chain="A"
+):
+    """
+    Search the MAE file for something equivalent to:
+
+        ... 264 ... "A" ... "ARG" ... "HH21" ...
+
+    and return the first integer on the line, which is the atom ID.
+
+    Example MAE line:
+
+        4232 44 6.144000 ... 264 R "A" 21 "ARG" "" "HH21" ...
+
+    returns:
+        4232
+    """
+
+    matches = []
+
+    with open(
+        mae_file,
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as f:
+
+        for line_number, line in enumerate(f, start=1):
+
+            # Quick filters first
+            if atomname not in line:
+                continue
+
+            if resname not in line:
+                continue
+
+            # Require exact residue number as an integer field
+            if not re.search(
+                rf"(?<![\d.]){resid}(?![\d.])",
+                line
+            ):
+                continue
+
+            # Look for chain, residue name and atom name.
+            #
+            # Handles quoted MAE fields such as:
+            # "A"
+            # "ARG"
+            # "HH21"
+
+            if (
+                f'"{chain}"' not in line
+                and f" {chain} " not in line
+            ):
+                continue
+
+            if (
+                f'"{resname}"' not in line
+                and f" {resname} " not in line
+            ):
+                continue
+
+            if (
+                f'"{atomname}"' not in line
+                and f" {atomname} " not in line
+            ):
+                continue
+
+            # First field of an atom record is the atom ID
+            atomid_match = re.match(
+                r"^\s*(\d+)",
+                line
+            )
+
+            if atomid_match:
+                atomid = int(atomid_match.group(1))
+
+                matches.append(
+                    (atomid, line_number, line.rstrip())
+                )
+
+    if len(matches) == 0:
+        raise ValueError(
+            "\nCould not find atom in MAE file:\n"
+            f"  Chain    = {chain}\n"
+            f"  Residue  = {resname} {resid}\n"
+            f"  Atom     = {atomname}\n"
+            f"  File     = {mae_file}"
+        )
+
+    if len(matches) > 1:
+        print("\nWARNING: Multiple MAE lines matched:")
+
+        for atomid, line_number, line in matches:
+            print(
+                f"Line {line_number}: "
+                f"atomid={atomid}"
+            )
+            print(line)
+
+        print("\nUsing the first match.\n")
+
+    atomid, line_number, line = matches[0]
+
+    return atomid, line_number, line
+
+
+def modify_hbond_constraint(
+    input_file,
+    resname,
+    resid,
+    atomname,
+    atomid,
+    chain="A",
+    make_backup=True
+):
+    """
+    Replace the existing HBOND_CONSTRAINTS line.
+
+    Generates:
+
+    HBOND_CONSTRAINTS   "A:ARG:264:HH21(hbond) 4232",
+    """
+
+    input_file = Path(input_file)
+
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {input_file}"
+        )
+
+    if make_backup:
+        backup_file = Path(
+            str(input_file) + ".bak"
+        )
+
+        shutil.copy2(
+            input_file,
+            backup_file
+        )
+
+        print(
+            f"Backup created: {backup_file}"
+        )
+
+    new_constraint = (
+        f'{chain}:{resname}:{resid}:{atomname}'
+        f'(hbond) {atomid}'
+    )
+
+    with open(
+        input_file,
+        "r",
+        encoding="utf-8"
+    ) as f:
+        lines = f.readlines()
+
+    found = False
+
+    for i, line in enumerate(lines):
+
+        if line.lstrip().startswith(
+            "HBOND_CONSTRAINTS"
+        ):
+
+            # Preserve indentation
+            indentation = (
+                line[:len(line) - len(line.lstrip())]
+            )
+
+            lines[i] = (
+                f'{indentation}'
+                f'HBOND_CONSTRAINTS   '
+                f'"{new_constraint}",\n'
+            )
+
+            found = True
+            break
+
+    if not found:
+        raise ValueError(
+            f"Could not find HBOND_CONSTRAINTS "
+            f"in {input_file}"
+        )
+
+    with open(
+        input_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        f.writelines(lines)
+
+    return new_constraint
+
+
+def setup_hbond_constraint(
+    folder,
+    excel_file,
+    generic_position,
+    mae_filename,
+    constraint_filename,
+    chain="A",
+    sheet_name="Residue table",
+    generic_column="GPCRdb(A)",
+    make_backup=True
+):
+    """
+    Complete workflow:
+
+    1. Read protein from folder name
+    2. Convert generic position to residue
+    3. Determine HBOND atom
+    4. Find atom ID in MAE
+    5. Modify HBOND_CONSTRAINTS
+    """
+
+    folder = Path(folder)
+
+    # --------------------------------------------------------
+    # 1. Protein name from folder
+    # --------------------------------------------------------
+
+    protein = get_protein_from_folder(folder)
+
+    print("\n========================================")
+    print("Protein:", protein)
+    print("========================================")
+
+    # --------------------------------------------------------
+    # 2. Generic position -> residue
+    # --------------------------------------------------------
+
+    aa, resname, resid = get_residue_from_generic(
+        excel_file=excel_file,
+        protein=protein,
+        generic_position=generic_position,
+        sheet_name=sheet_name,
+        generic_column=generic_column
+    )
+
+    print(
+        f"Generic position: {generic_position}"
+    )
+
+    print(
+        f"Residue: {aa}{resid} ({resname})"
+    )
+
+    # --------------------------------------------------------
+    # 3. Determine hydrogen atom
+    # --------------------------------------------------------
+
+    atomname = get_hbond_atom(
+        resname
+    )
+
+    print(
+        f"HBOND atom: {atomname}"
+    )
+
+    # --------------------------------------------------------
+    # 4. Find atom ID in MAE
+    # --------------------------------------------------------
+
+    mae_file = folder / mae_filename
+
+    if not mae_file.exists():
+        raise FileNotFoundError(
+            f"MAE file does not exist:\n{mae_file}"
+        )
+
+    atomid, line_number, mae_line = (
+        find_atom_id_in_mae(
+            mae_file=mae_file,
+            resname=resname,
+            resid=resid,
+            atomname=atomname,
+            chain=chain
+        )
+    )
+
+    print(
+        f"Atom ID: {atomid}"
+    )
+
+    print(
+        f"Found on MAE line: {line_number}"
+    )
+
+    print("\nMatched MAE line:")
+    print(mae_line)
+
+    # --------------------------------------------------------
+    # 5. Modify constraint file
+    # --------------------------------------------------------
+
+    constraint_file = (
+        folder / constraint_filename
+    )
+
+    new_constraint = modify_hbond_constraint(
+        input_file=constraint_file,
+        resname=resname,
+        resid=resid,
+        atomname=atomname,
+        atomid=atomid,
+        chain=chain,
+        make_backup=make_backup
+    )
+
+    print("\n========================================")
+    print("HBOND constraint updated")
+    print("========================================")
+
+    print(
+        f'HBOND_CONSTRAINTS   "{new_constraint}",'
+    )
+
+    # Also return everything in case you want to use
+    # the information later in your script.
+
+    return {
+        "protein": protein,
+        "generic_position": generic_position,
+        "aa": aa,
+        "resname": resname,
+        "resid": resid,
+        "atomname": atomname,
+        "atomid": atomid,
+        "chain": chain,
+        "constraint": new_constraint
+    }
+
+
+# ============================================================
+# USER INPUT
+# ============================================================
+
+# Automatically use the directory where the script is run
+folder = os.getcwd()
+
+# Protein is automatically obtained from folder name
+protein = os.path.basename(os.path.normpath(folder))
+
+# Residue mapping table
+excel_file = r"residue_table.xlsx"
+
+# Generic position to constrain
+generic_position = ""
+
+# Files located inside the current protein folder
+mae_filename = "*.mae"
+constraint_filename = "*.in"
+
+chain = "A"
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+print(f"Current folder : {folder}")
+print(f"Protein        : {protein}")
+
+result = setup_hbond_constraint(
+    folder=folder,
+    excel_file=excel_file,
+    generic_position=generic_position,
+    mae_filename=mae_filename,
+    constraint_filename=constraint_filename,
+    chain=chain
+)
