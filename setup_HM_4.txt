@@ -1,0 +1,183 @@
+#!/bin/bash
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+WORK_DIR="$(pwd)"
+
+# Protein list
+FAMILY_LIST="${WORK_DIR}/family_list.txt"
+
+# Protein folders
+OUTPUT_DIR="${WORK_DIR}/family_models"
+
+# Template that will be copied into every protein folder
+TEMPLATE_SCRIPT="${WORK_DIR}/template_ProteinPrep.sh"
+
+# Name of copied script inside each protein folder
+DEST_SCRIPT_NAME="run_ProteinPrep.sh"
+
+# Prefix for Schrodinger -JOBNAME
+JOBNAME_PREFIX="proteinprep"
+
+
+# ============================================================
+# CHECK INPUTS
+# ============================================================
+
+if [[ ! -f "$FAMILY_LIST" ]]; then
+    echo "ERROR: Family list not found:"
+    echo "$FAMILY_LIST"
+    exit 1
+fi
+
+if [[ ! -f "$TEMPLATE_SCRIPT" ]]; then
+    echo "ERROR: Template script not found:"
+    echo "$TEMPLATE_SCRIPT"
+    exit 1
+fi
+
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    echo "ERROR: Protein folder directory not found:"
+    echo "$OUTPUT_DIR"
+    exit 1
+fi
+
+
+# ============================================================
+# LOOP THROUGH PROTEINS
+# ============================================================
+
+while IFS= read -r protein
+do
+
+    # Remove Windows carriage return
+    protein="${protein//$'\r'/}"
+
+    # Skip blank lines
+    [[ -z "$protein" ]] && continue
+
+    # Skip comments
+    [[ "$protein" == \#* ]] && continue
+
+
+    echo
+    echo "============================================================"
+    echo "Preparing: $protein"
+    echo "============================================================"
+
+
+    # --------------------------------------------------------
+    # Protein directory
+    # --------------------------------------------------------
+
+    PROTEIN_DIR="${OUTPUT_DIR}/${protein}"
+
+
+    if [[ ! -d "$PROTEIN_DIR" ]]; then
+        echo "WARNING: Folder does not exist:"
+        echo "$PROTEIN_DIR"
+        echo "Skipping."
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # FASTA filename
+    #
+    # Example:
+    # OR51A4 -> OR51A4.fasta
+    # --------------------------------------------------------
+
+    FASTA_FILE="${protein}.fasta"
+
+    FASTA_PATH="${PROTEIN_DIR}/${FASTA_FILE}"
+
+
+    if [[ ! -f "$FASTA_PATH" ]]; then
+        echo "WARNING: FASTA file does not exist:"
+        echo "$FASTA_PATH"
+        echo "Skipping $protein."
+        continue
+    fi
+
+
+    # --------------------------------------------------------
+    # Schrodinger JOBNAME
+    #
+    # Example:
+    # OR51A4 -> proteinprep_OR51A4
+    # --------------------------------------------------------
+
+    SCHRODINGER_JOBNAME="${JOBNAME_PREFIX}_${protein}"
+
+
+    # --------------------------------------------------------
+    # Destination script
+    # --------------------------------------------------------
+
+    DEST_SCRIPT="${PROTEIN_DIR}/${DEST_SCRIPT_NAME}"
+
+
+    # --------------------------------------------------------
+    # Copy template
+    # --------------------------------------------------------
+
+    cp "$TEMPLATE_SCRIPT" "$DEST_SCRIPT"
+
+
+    if [[ $? -ne 0 ]]; then
+        echo "ERROR: Failed to copy template for $protein"
+        exit 1
+    fi
+
+
+    # ========================================================
+    # MODIFY -JOBNAME
+    # ========================================================
+
+    sed -E -i \
+        "s|(-JOBNAME[[:space:]]+)[^[:space:]]+|\1${SCHRODINGER_JOBNAME}|g" \
+        "$DEST_SCRIPT"
+
+
+    # ========================================================
+    # MODIFY -fasta_file
+    # ========================================================
+
+    sed -E -i \
+        "s|(-fasta_file[[:space:]]+)[^[:space:]]+|\1${FASTA_FILE}|g" \
+        "$DEST_SCRIPT"
+
+
+    # --------------------------------------------------------
+    # Make executable
+    # --------------------------------------------------------
+
+    chmod +x "$DEST_SCRIPT"
+
+
+    # ========================================================
+    # VERIFY MODIFICATIONS
+    # ========================================================
+
+    echo "Created:"
+    echo "$DEST_SCRIPT"
+
+    echo
+    echo "Modified parameters:"
+
+    grep -oE -- "-JOBNAME[[:space:]]+[^[:space:]]+" "$DEST_SCRIPT"
+
+    grep -oE -- "-fasta_file[[:space:]]+[^[:space:]]+" "$DEST_SCRIPT"
+
+
+done < "$FAMILY_LIST"
+
+
+echo
+echo "============================================================"
+echo "ALL PROTEINPREP SCRIPTS PREPARED"
+echo "============================================================"
