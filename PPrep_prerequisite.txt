@@ -1,0 +1,661 @@
+#!/bin/bash
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+# Directory where this script is launched
+WORK_DIR="$(pwd)"
+
+
+# ------------------------------------------------------------
+# Protein list
+# ------------------------------------------------------------
+
+FAMILY_LIST="${WORK_DIR}/family_list.txt"
+
+
+# ------------------------------------------------------------
+# Previous homology-modeling directory
+#
+# Example:
+# family_models/
+#     OR51A1/
+#     OR51A2/
+#     OR51A4/
+# ------------------------------------------------------------
+
+FAMILY_ROOT="${WORK_DIR}/family_models"
+
+
+# ------------------------------------------------------------
+# New working directory for Protein Preparation
+#
+# This script will create:
+#
+# PPrep/
+#     OR51A1/
+#     OR51A2/
+#     ...
+# ------------------------------------------------------------
+
+PPREP_ROOT="${WORK_DIR}/PPrep"
+
+
+# ------------------------------------------------------------
+# Status file produced by homology modeling
+#
+# Change this to the exact filename used in every protein folder.
+#
+# Example:
+# template_OR51_Family.status
+# ------------------------------------------------------------
+
+STATUS_FILENAME="template_OR51_Family.status"
+
+
+# ------------------------------------------------------------
+# Structure file produced by homology modeling
+#
+# Same filename is expected in every family_models/<protein>/
+#
+# Change this to your actual output structure filename.
+# ------------------------------------------------------------
+
+STRUCTURE_FILENAME="template_OR51_Family-bld-out.pdb"
+
+
+# ------------------------------------------------------------
+# ProteinPrep template
+#
+# This template stays in WORK_DIR.
+# ------------------------------------------------------------
+
+TEMPLATE_SCRIPT="${WORK_DIR}/template_ProteinPrep.sh"
+
+
+# ------------------------------------------------------------
+# Name of customized script copied into each PPrep folder
+# ------------------------------------------------------------
+
+DEST_SCRIPT_NAME="run_ProteinPrep.sh"
+
+
+# ------------------------------------------------------------
+# Schrodinger JOBNAME prefix
+#
+# Example:
+# OR51A4 -> proteinprep_OR51A4
+# ------------------------------------------------------------
+
+JOBNAME_PREFIX="proteinprep"
+
+
+# ------------------------------------------------------------
+# Output status CSV
+# ------------------------------------------------------------
+
+STATUS_CSV="${WORK_DIR}/family_model_status.csv"
+
+
+# ============================================================
+# CHECK REQUIRED INPUTS
+# ============================================================
+
+if [[ ! -f "$FAMILY_LIST" ]]; then
+
+    echo "ERROR: Family list not found:"
+    echo "$FAMILY_LIST"
+
+    exit 1
+fi
+
+
+if [[ ! -d "$FAMILY_ROOT" ]]; then
+
+    echo "ERROR: Family-model directory not found:"
+    echo "$FAMILY_ROOT"
+
+    exit 1
+fi
+
+
+if [[ ! -f "$TEMPLATE_SCRIPT" ]]; then
+
+    echo "ERROR: ProteinPrep template not found:"
+    echo "$TEMPLATE_SCRIPT"
+
+    exit 1
+fi
+
+
+# ============================================================
+# CREATE PPREP DIRECTORY
+# ============================================================
+
+mkdir -p "$PPREP_ROOT"
+
+
+# ============================================================
+# INITIALIZE STATUS CSV
+# ============================================================
+
+echo "Protein,Status" > "$STATUS_CSV"
+
+
+# ============================================================
+# COUNTERS
+# ============================================================
+
+total_count=0
+success_count=0
+failed_count=0
+prepared_count=0
+
+
+# ============================================================
+# LOOP THROUGH FAMILY LIST
+# ============================================================
+
+while IFS= read -r protein || [[ -n "$protein" ]]
+do
+
+    # --------------------------------------------------------
+    # Remove Windows carriage-return characters
+    # --------------------------------------------------------
+
+    protein="${protein//$'\r'/}"
+
+
+    # --------------------------------------------------------
+    # Trim leading/trailing whitespace
+    # --------------------------------------------------------
+
+    protein="$(echo "$protein" | xargs)"
+
+
+    # --------------------------------------------------------
+    # Skip empty lines
+    # --------------------------------------------------------
+
+    [[ -z "$protein" ]] && continue
+
+
+    # --------------------------------------------------------
+    # Skip comments
+    # --------------------------------------------------------
+
+    [[ "$protein" == \#* ]] && continue
+
+
+    ((total_count++))
+
+
+    echo
+    echo "============================================================"
+    echo "Checking: $protein"
+    echo "============================================================"
+
+
+    # ========================================================
+    # DEFINE SOURCE FILES
+    # ========================================================
+
+    SOURCE_DIR="${FAMILY_ROOT}/${protein}"
+
+    STATUS_FILE="${SOURCE_DIR}/${STATUS_FILENAME}"
+
+    STRUCTURE_FILE="${SOURCE_DIR}/${STRUCTURE_FILENAME}"
+
+    FASTA_FILENAME="${protein}.fasta"
+
+    FASTA_FILE="${SOURCE_DIR}/${FASTA_FILENAME}"
+
+
+    # ========================================================
+    # DEFAULT STATUS = 0
+    # ========================================================
+
+    status=0
+
+
+    # ========================================================
+    # CHECK SOURCE DIRECTORY
+    # ========================================================
+
+    if [[ ! -d "$SOURCE_DIR" ]]; then
+
+        echo "STATUS: 0"
+        echo "Reason: Family-model folder is missing:"
+        echo "$SOURCE_DIR"
+
+        echo "${protein},0" >> "$STATUS_CSV"
+
+        ((failed_count++))
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # CHECK STATUS FILE EXISTS
+    # ========================================================
+
+    if [[ ! -f "$STATUS_FILE" ]]; then
+
+        echo "STATUS: 0"
+        echo "Reason: Status file is missing:"
+        echo "$STATUS_FILE"
+
+        echo "${protein},0" >> "$STATUS_CSV"
+
+        ((failed_count++))
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # CHECK FOR EXPLICIT FAILURE MESSAGES
+    # ========================================================
+
+    license_failure=0
+    backend_failure=0
+
+
+    if grep -Fqi \
+        "Could not check out license" \
+        "$STATUS_FILE"
+    then
+        license_failure=1
+    fi
+
+
+    if grep -Fqi \
+        "No structure produced by backend" \
+        "$STATUS_FILE"
+    then
+        backend_failure=1
+    fi
+
+
+    # ========================================================
+    # CHECK SUCCESS CONDITIONS
+    #
+    # BOTH lines must exist:
+    #
+    # Backend successfully completed
+    # RETURNED LICENSE
+    # ========================================================
+
+    backend_success=0
+    license_returned=0
+
+
+    if grep -Fqi \
+        "Backend successfully completed" \
+        "$STATUS_FILE"
+    then
+        backend_success=1
+    fi
+
+
+    if grep -Fqi \
+        "RETURNED LICENSE" \
+        "$STATUS_FILE"
+    then
+        license_returned=1
+    fi
+
+
+    # ========================================================
+    # DETERMINE FINAL STATUS
+    # ========================================================
+
+    if (( backend_success == 1 && license_returned == 1 )); then
+
+        status=1
+
+    else
+
+        status=0
+
+    fi
+
+
+    # ========================================================
+    # WRITE CSV
+    # ========================================================
+
+    echo "${protein},${status}" >> "$STATUS_CSV"
+
+
+    # ========================================================
+    # REPORT FAILED / INCOMPLETE JOB
+    # ========================================================
+
+    if (( status == 0 )); then
+
+        ((failed_count++))
+
+        echo "STATUS: 0 -- NOT successfully completed"
+
+
+        if (( license_failure == 1 )); then
+
+            echo "Reason detected:"
+            echo "  Could not check out license"
+
+        fi
+
+
+        if (( backend_failure == 1 )); then
+
+            echo "Reason detected:"
+            echo "  No structure produced by backend"
+
+        fi
+
+
+        if (( backend_success == 0 )); then
+
+            echo "Missing success marker:"
+            echo "  Backend successfully completed"
+
+        fi
+
+
+        if (( license_returned == 0 )); then
+
+            echo "Missing success marker:"
+            echo "  RETURNED LICENSE"
+
+        fi
+
+
+        echo
+        echo "PPrep folder will NOT be prepared for $protein."
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    ((success_count++))
+
+    echo "STATUS: 1 -- Successfully completed"
+
+    echo "Found:"
+    echo "  Backend successfully completed"
+    echo "  RETURNED LICENSE"
+
+
+    # ========================================================
+    # CHECK STRUCTURE FILE
+    # ========================================================
+
+    if [[ ! -f "$STRUCTURE_FILE" ]]; then
+
+        echo
+        echo "WARNING:"
+        echo "Homology job status is successful, but structure file"
+        echo "was not found:"
+        echo
+        echo "$STRUCTURE_FILE"
+        echo
+        echo "Skipping PPrep setup for $protein."
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # CHECK FASTA FILE
+    # ========================================================
+
+    if [[ ! -f "$FASTA_FILE" ]]; then
+
+        echo
+        echo "WARNING:"
+        echo "FASTA file was not found:"
+        echo
+        echo "$FASTA_FILE"
+        echo
+        echo "Skipping PPrep setup for $protein."
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # CREATE NEW PPREP DIRECTORY
+    # ========================================================
+
+    DEST_DIR="${PPREP_ROOT}/${protein}"
+
+    mkdir -p "$DEST_DIR"
+
+
+    echo
+    echo "Creating ProteinPrep directory:"
+    echo "$DEST_DIR"
+
+
+    # ========================================================
+    # COPY STRUCTURE
+    # ========================================================
+
+    cp \
+        "$STRUCTURE_FILE" \
+        "${DEST_DIR}/${STRUCTURE_FILENAME}"
+
+
+    if [[ $? -ne 0 ]]; then
+
+        echo "ERROR: Failed to copy structure for $protein"
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # COPY FASTA
+    # ========================================================
+
+    cp \
+        "$FASTA_FILE" \
+        "${DEST_DIR}/${FASTA_FILENAME}"
+
+
+    if [[ $? -ne 0 ]]; then
+
+        echo "ERROR: Failed to copy FASTA for $protein"
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # COPY PROTEINPREP TEMPLATE
+    # ========================================================
+
+    DEST_SCRIPT="${DEST_DIR}/${DEST_SCRIPT_NAME}"
+
+
+    cp \
+        "$TEMPLATE_SCRIPT" \
+        "$DEST_SCRIPT"
+
+
+    if [[ $? -ne 0 ]]; then
+
+        echo "ERROR: Failed to copy ProteinPrep template for $protein"
+
+        continue
+
+    fi
+
+
+    # ========================================================
+    # DEFINE SCHRODINGER JOBNAME
+    # ========================================================
+
+    SCHRODINGER_JOBNAME="${JOBNAME_PREFIX}_${protein}"
+
+
+    # ========================================================
+    # MODIFY -JOBNAME
+    #
+    # Example:
+    #
+    # -JOBNAME proteinprep_1
+    #
+    # becomes:
+    #
+    # -JOBNAME proteinprep_OR51A4
+    # ========================================================
+
+    sed -E -i \
+        "s|(-JOBNAME[[:space:]]+)[^[:space:]]+|\1${SCHRODINGER_JOBNAME}|g" \
+        "$DEST_SCRIPT"
+
+
+    # ========================================================
+    # MODIFY -fasta_file
+    #
+    # Example:
+    #
+    # -fasta_file OR51A4.fasta
+    #
+    # becomes, depending on folder:
+    #
+    # -fasta_file OR51A7.fasta
+    # ========================================================
+
+    sed -E -i \
+        "s|(-fasta_file[[:space:]]+)[^[:space:]]+|\1${FASTA_FILENAME}|g" \
+        "$DEST_SCRIPT"
+
+
+    # ========================================================
+    # OPTIONAL STRUCTURE-FILENAME PLACEHOLDER
+    #
+    # If your template contains:
+    #
+    # __STRUCTURE_FILE__
+    #
+    # this replaces it with:
+    #
+    # template_OR51_Family-bld-out.pdb
+    #
+    # If the placeholder is not present, nothing happens.
+    # ========================================================
+
+    sed -i \
+        "s|__STRUCTURE_FILE__|${STRUCTURE_FILENAME}|g" \
+        "$DEST_SCRIPT"
+
+
+    # ========================================================
+    # MAKE SCRIPT EXECUTABLE
+    # ========================================================
+
+    chmod +x "$DEST_SCRIPT"
+
+
+    # ========================================================
+    # VERIFY CUSTOMIZATION
+    # ========================================================
+
+    echo
+    echo "Files copied:"
+    echo "  ${STRUCTURE_FILENAME}"
+    echo "  ${FASTA_FILENAME}"
+    echo "  ${DEST_SCRIPT_NAME}"
+
+
+    echo
+    echo "ProteinPrep settings:"
+
+
+    jobname_check=$(
+        grep -oE -- \
+        "-JOBNAME[[:space:]]+[^[:space:]]+" \
+        "$DEST_SCRIPT" |
+        head -1
+    )
+
+
+    fasta_check=$(
+        grep -oE -- \
+        "-fasta_file[[:space:]]+[^[:space:]]+" \
+        "$DEST_SCRIPT" |
+        head -1
+    )
+
+
+    if [[ -n "$jobname_check" ]]; then
+
+        echo "  $jobname_check"
+
+    else
+
+        echo "  WARNING: -JOBNAME was not found in template!"
+
+    fi
+
+
+    if [[ -n "$fasta_check" ]]; then
+
+        echo "  $fasta_check"
+
+    else
+
+        echo "  WARNING: -fasta_file was not found in template!"
+
+    fi
+
+
+    ((prepared_count++))
+
+
+done < "$FAMILY_LIST"
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+echo
+echo
+echo "============================================================"
+echo "PREPARATION COMPLETE"
+echo "============================================================"
+
+echo
+echo "Proteins checked      : $total_count"
+echo "Successful models     : $success_count"
+echo "Failed/incomplete     : $failed_count"
+echo "PPrep folders created : $prepared_count"
+
+echo
+echo "Status CSV:"
+echo "$STATUS_CSV"
+
+echo
+echo "ProteinPrep directory:"
+echo "$PPREP_ROOT"
+
+echo
+echo "============================================================"
