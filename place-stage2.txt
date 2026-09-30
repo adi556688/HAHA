@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+
+
+def read_info_file(info_file):
+    """
+    Read:
+      1. Cu coordinates from the first non-comment line
+      2. Cysteine chain/residue information from '# Cys ...' lines
+      3. Target chain from '# Chain/model: ...' if available
+
+    Returns
+    -------
+    x, y, z, occupancy, bfactor, element
+    cys_targets : set of (chain, resid)
+    copper_chain
+    """
+
+    with open(info_file, "r") as f:
+        lines = f.readlines()
+
+    # ------------------------------------------------------------
+    # 1. Read Cu coordinate line
+    # Example:
+    # -9.291  2.335  -6.249  1.00  0.00  CU
+    # ------------------------------------------------------------
+    coordinate_line = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped and not stripped.startswith("#"):
+            coordinate_line = stripped
+            break
+
+    if coordinate_line is None:
+        raise ValueError(
+            "Could not find the Cu coordinate line in the text file."
+        )
+
+    fields = coordinate_line.split()
+
+    if len(fields) < 3:
+        raise ValueError(
+            f"Invalid Cu coordinate line:\n{coordinate_line}"
+        )
+
+    x = float(fields[0])
+    y = float(fields[1])
+    z = float(fields[2])
+
+    occupancy = float(fields[3]) if len(fields) > 3 else 1.00
+    bfactor = float(fields[4]) if len(fields) > 4 else 0.00
+    element = fields[5].upper() if len(fields) > 5 else "CU"
+
+    # ------------------------------------------------------------
+    # 2. Find cysteine residues
+    #
+    # Example:
+    # # Cys 1: ... ATOM serial=3024 SG CYS chain='A' resid=202; ...
+    # # Cys 2: ... ATOM serial=3035 SG CYS chain='A' resid=203; ...
+    # ------------------------------------------------------------
+    cys_targets = set()
+
+    for line in lines:
+
+        if "Cys" not in line:
+            continue
+
+        match = re.search(
+            r"chain\s*=\s*['\"]?([^'\"\s;]+)['\"]?"
+            r".*?"
+            r"resid\s*=\s*(-?\d+)",
+            line,
+            re.IGNORECASE
+        )
+
+        if match:
+            chain = match.group(1)
+            resid = int(match.group(2))
+
+            cys_targets.add((chain, resid))
+
+    if not cys_targets:
+        raise ValueError(
+            "Could not find cysteine chain/residue information "
+            "in the text file."
+        )
+
+    # ------------------------------------------------------------
+    # 3. Read Chain/model line if available
+    #
+    # Example:
+    # # Chain/model: 'A' / 1
+    # ------------------------------------------------------------
+    copper_chain = None
+
+    for line in lines:
+
+        if "Chain/model" in line:
+
+            match = re.search(
+                r"Chain/model\s*:\s*['\"]?([^'\"\s/]+)['\"]?",
+                line
+            )
+
+            if match:
+                copper_chain = match.group(1)
+                break
+
+    # If Chain/model is absent, use chain from first cysteine
+    if copper_chain is None:
+        copper_chain = sorted(cys_targets)[0][0]
+
+    return (
+        x,
+        y,
+        z,
+        occupancy,
+        bfactor,
+        element,
+        cys_targets,
+        copper_chain,
+    )
+
+
+def get_record_name(line):
+    """Return PDB record name."""
+    return line[0:6].strip() if len(line) >= 6 else ""
+
+
+def get_atom_serial(line):
+    """Read PDB atom/TER serial number."""
+    try:
+        return int(line[6:11].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def get_residue_number(line):
+    """
+    Read PDB residue number.
+
+    For something like residue 306A:
+        resSeq = 306
+        insertion code = A
+
+    Only the numerical portion (306) is returned.
+    """
+    try:
+        return int(line[22:26].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def remove_cys_hg(lines, cys_targets):
+    """
+    Remove HG atoms belonging to the cysteine residues reported
+    in the Cu-coordinate text file.
+    """
+
+    new_lines = []
+    removed = []
+
+    for line in lines:
+
+        record = get_record_name(line)
+
+        if record in ("ATOM", "HETATM") and len(line) >= 27:
+
+            atom_name = line[12:16].strip()
+            residue_name = line[17:20].strip()
+            chain = line[21].strip()
+
+            try:
+                resid = int(line[22:26].strip())
+            except ValueError:
+                resid = None
+
+            # Remove only:
+            #    atom = HG
+            #    residue = CYS
+            #    chain/resid found in text file
+            if (
+                atom_name == "HG"
+                and residue_name == "CYS"
+                and (chain, resid) in cys_targets
+            ):
+
+                serial = get_atom_serial(line)
+
+                removed.append(
+                    {
+                        "serial": serial,
+                        "chain": chain,
+                        "resid": resid,
+                        "line": line.rstrip(),
+                    }
+                )
+
+                # Do not copy this HG line
+                continue
+
+        new_lines.append(line)
+
+    return new_lines, removed
+
+
+def find_next_atom_serial(lines):
+    """
+    Find the next available PDB serial number.
+
+    Includes ATOM, HETATM and TER because TER also has a serial
+    number in the example PDB.
+    """
+
+    max_serial = 0
+
+    for line in lines:
+
+        record = get_record_name(line)
+
+        if record in ("ATOM", "HETATM", "TER"):
+
+            serial = get_atom_serial(line)
+
+            if serial is not None:
+                max_serial = max(max_serial, serial)
+
+    return max_serial + 1
+
+
+def find_next_residue_number(lines, chain):
+    """
+    Find next residue number for the copper residue on the
+    requested chain.
+
+    Example:
+        last residue = 306A
+        Cu residue    = 307
+    """
+
+    max_resid = 0
+
+    for line in lines:
+
+        record = get_record_name(line)
+
+        if record not in ("ATOM", "HETATM"):
+            continue
+
+        if len(line) < 27:
+            continue
+
+        pdb_chain = line[21].strip()
+
+        if pdb_chain != chain:
+            continue
+
+        resid = get_residue_number(line)
+
+        if resid is not None:
+            max_resid = max(max_resid, resid)
+
+    if max_resid == 0:
+        raise ValueError(
+            f"Could not determine residue numbering for chain '{chain}'."
+        )
+
+    return max_resid + 1
+
+
+def make_copper_pdb_line(
+    serial,
+    resid,
+    chain,
+    x,
+    y,
+    z,
+    occupancy,
+    bfactor,
+    element="CU",
+):
+    """
+    Generate an 80-column PDB HETATM line.
+
+    Example:
+    HETATM 4689 CU    CU A 307      -9.291   2.335  -6.249  1.00  0.00          CU1+
+    """
+
+    atom_name = "CU"
+    residue_name = "CU"
+    charge = "1+"
+
+    line = (
+        f"HETATM"
+        f"{serial:5d}"
+        f" "
+        f"{atom_name:<4s}"
+        f" "
+        f"{residue_name:>3s}"
+        f" "
+        f"{chain:1s}"
+        f"{resid:4d}"
+        f" "
+        f"   "
+        f"{x:8.3f}"
+        f"{y:8.3f}"
+        f"{z:8.3f}"
+        f"{occupancy:6.2f}"
+        f"{bfactor:6.2f}"
+        f"          "
+        f"{element:>2s}"
+        f"{charge:>2s}"
+    )
+
+    return line + "\n"
+
+
+def insert_copper_line(lines, copper_line):
+    """
+    Insert Cu after the coordinate/TER section and before
+    CONECT, MASTER, or END.
+    """
+
+    insertion_index = len(lines)
+
+    for i, line in enumerate(lines):
+
+        record = get_record_name(line)
+
+        if record in ("CONECT", "MASTER", "END"):
+            insertion_index = i
+            break
+
+    return (
+        lines[:insertion_index]
+        + [copper_line]
+        + lines[insertion_index:]
+    )
+
+
+def modify_pdb(info_file, pdb_file, output_file):
+
+    # ------------------------------------------------------------
+    # Read information from text file
+    # ------------------------------------------------------------
+    (
+        x,
+        y,
+        z,
+        occupancy,
+        bfactor,
+        element,
+        cys_targets,
+        copper_chain,
+    ) = read_info_file(info_file)
+
+    print("\nInformation read from text file")
+    print("--------------------------------")
+    print(
+        f"Cu coordinates : "
+        f"{x:.3f}  {y:.3f}  {z:.3f}"
+    )
+
+    print(f"Cu chain       : {copper_chain}")
+
+    print("Cysteines      :")
+
+    for chain, resid in sorted(cys_targets):
+        print(f"    chain {chain}, resid {resid}")
+
+    # ------------------------------------------------------------
+    # Read PDB
+    # ------------------------------------------------------------
+    with open(pdb_file, "r") as f:
+        lines = f.readlines()
+
+    # ------------------------------------------------------------
+    # Remove HG from coordinating cysteines
+    # ------------------------------------------------------------
+    lines, removed = remove_cys_hg(
+        lines,
+        cys_targets
+    )
+
+    # ------------------------------------------------------------
+    # Determine new Cu serial and residue ID
+    # ------------------------------------------------------------
+    copper_serial = find_next_atom_serial(lines)
+
+    copper_resid = find_next_residue_number(
+        lines,
+        copper_chain
+    )
+
+    # ------------------------------------------------------------
+    # Make PDB Cu line
+    # ------------------------------------------------------------
+    copper_line = make_copper_pdb_line(
+        serial=copper_serial,
+        resid=copper_resid,
+        chain=copper_chain,
+        x=x,
+        y=y,
+        z=z,
+        occupancy=occupancy,
+        bfactor=bfactor,
+        element=element,
+    )
+
+    # ------------------------------------------------------------
+    # Insert Cu before CONECT/END
+    # ------------------------------------------------------------
+    lines = insert_copper_line(
+        lines,
+        copper_line
+    )
+
+    # ------------------------------------------------------------
+    # Write output
+    # ------------------------------------------------------------
+    with open(output_file, "w") as f:
+        f.writelines(lines)
+
+    # ------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------
+    print("\nPDB modifications")
+    print("-----------------")
+
+    if removed:
+
+        for item in removed:
+            print(
+                f"Removed HG: "
+                f"atom serial={item['serial']} "
+                f"CYS {item['chain']} {item['resid']}"
+            )
+
+    else:
+        print(
+            "WARNING: No matching CYS HG atoms were found."
+        )
+
+    print("\nAdded Cu:")
+    print(copper_line.rstrip())
+
+    print(f"\nOutput written to:\n{output_file}")
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Place Cu coordinates into a PDB and remove the HG "
+            "atoms from coordinating cysteine residues."
+        )
+    )
+
+    parser.add_argument(
+        "info_file",
+        help="Cu coordinate/information text file"
+    )
+
+    parser.add_argument(
+        "pdb_file",
+        help="Input PDB file"
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help=(
+            "Output PDB filename. "
+            "Default: <input>_PlaceCopper_noSH.pdb"
+        )
+    )
+
+    args = parser.parse_args()
+
+    # Automatically make output name if -o is not provided
+    if args.output is None:
+
+        base, ext = os.path.splitext(args.pdb_file)
+
+        if not ext:
+            ext = ".pdb"
+
+        output_file = base + "_PlaceCopper_noSH" + ext
+
+    else:
+        output_file = args.output
+
+    modify_pdb(
+        info_file=args.info_file,
+        pdb_file=args.pdb_file,
+        output_file=output_file,
+    )
+
+
+if __name__ == "__main__":
+    main()
