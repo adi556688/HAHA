@@ -1,0 +1,663 @@
+import os
+import shlex
+import shutil
+from pathlib import Path
+
+
+# ============================================================
+# FIND EXACTLY ONE FILE
+# ============================================================
+
+def resolve_single_file(folder, filename_or_pattern):
+    """
+    Accept either an exact filename:
+
+        converted.mae
+
+    or a wildcard:
+
+        *.mae
+
+    There must be exactly ONE matching file.
+    """
+
+    folder = Path(folder)
+
+    if any(char in filename_or_pattern for char in "*?[]"):
+
+        matches = sorted(
+            folder.glob(filename_or_pattern)
+        )
+
+        # Ignore backup files
+        matches = [
+            f for f in matches
+            if not f.name.endswith(".bak")
+        ]
+
+        if len(matches) == 0:
+
+            raise FileNotFoundError(
+                f"\nNo file matched:\n"
+                f"  Folder  = {folder}\n"
+                f"  Pattern = {filename_or_pattern}"
+            )
+
+        if len(matches) > 1:
+
+            match_text = "\n".join(
+                f"  {f.name}"
+                for f in matches
+            )
+
+            raise ValueError(
+                f"\nMultiple files matched "
+                f"'{filename_or_pattern}':\n"
+                f"{match_text}\n\n"
+                f"There must be exactly one."
+            )
+
+        return matches[0]
+
+    file_path = folder / filename_or_pattern
+
+    if not file_path.exists():
+
+        raise FileNotFoundError(
+            f"\nFile does not exist:\n"
+            f"{file_path}"
+        )
+
+    return file_path
+
+
+# ============================================================
+# PARSE POSSIBLE MAE ATOM LINE
+# ============================================================
+
+def parse_mae_atom_line(line):
+    """
+    Parse one possible atom line from a Maestro .mae file.
+
+    Example:
+
+        2323 86 -9.544124 1.715803 -6.249318 ...
+
+    The first field is treated as the atom ID.
+
+    Returns:
+
+        {
+            "atomid": 2323,
+            "fields": [...]
+        }
+
+    or None if the line does not look like an atom record.
+    """
+
+    try:
+
+        fields = shlex.split(
+            line,
+            posix=True
+        )
+
+    except ValueError:
+
+        return None
+
+    if len(fields) < 5:
+
+        return None
+
+    # --------------------------------------------------------
+    # First field = atom ID
+    # --------------------------------------------------------
+
+    try:
+
+        atomid = int(fields[0])
+
+    except (ValueError, IndexError):
+
+        return None
+
+    # --------------------------------------------------------
+    # Confirm this looks like an atom line using XYZ fields
+    # --------------------------------------------------------
+
+    try:
+
+        float(fields[2])
+        float(fields[3])
+        float(fields[4])
+
+    except (ValueError, IndexError):
+
+        return None
+
+    return {
+        "atomid": atomid,
+        "fields": fields
+    }
+
+
+# ============================================================
+# FIND CU ATOM IN MAE
+# ============================================================
+
+def find_metal_atom_id_in_mae(
+    mae_file,
+    metal="CU"
+):
+    """
+    Find exactly ONE metal atom.
+
+    Logic:
+
+    1. Parse atom line.
+    2. Look for an exact CU field.
+    3. Take the first field as atom ID.
+
+    Example:
+
+        2323 ... "CU " ... "CU " ...
+
+    After parsing:
+
+        "CU " -> CU
+
+    so this line is recognized as Cu and:
+
+        atomid = 2323
+
+    There must be exactly ONE matching Cu atom.
+    """
+
+    mae_file = Path(mae_file)
+
+    target_metal = metal.strip().upper()
+
+    matches = []
+
+    with open(
+        mae_file,
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as f:
+
+        for line_number, line in enumerate(
+            f,
+            start=1
+        ):
+
+            parsed = parse_mae_atom_line(
+                line
+            )
+
+            if parsed is None:
+
+                continue
+
+            atomid = parsed["atomid"]
+
+            fields = parsed["fields"]
+
+            # ------------------------------------------------
+            # Normalize parsed fields
+            #
+            # "CU "
+            # becomes:
+            # CU
+            # ------------------------------------------------
+
+            normalized_fields = [
+                str(field).strip().upper()
+                for field in fields
+            ]
+
+            # ------------------------------------------------
+            # Must contain exact CU field
+            # ------------------------------------------------
+
+            if target_metal not in normalized_fields:
+
+                continue
+
+            # ------------------------------------------------
+            # Valid Cu atom
+            # ------------------------------------------------
+
+            matches.append(
+                {
+                    "atomid": atomid,
+                    "line_number": line_number,
+                    "line": line.rstrip()
+                }
+            )
+
+    # ========================================================
+    # NO CU FOUND
+    # ========================================================
+
+    if len(matches) == 0:
+
+        raise ValueError(
+            f"\nCould not find a {target_metal} atom "
+            f"in MAE file:\n"
+            f"{mae_file}"
+        )
+
+    # ========================================================
+    # MULTIPLE CU ATOMS
+    # ========================================================
+
+    if len(matches) > 1:
+
+        print()
+        print("=" * 70)
+        print("ERROR: MULTIPLE METAL ATOMS FOUND")
+        print("=" * 70)
+
+        print(
+            f"\nFound {len(matches)} "
+            f"{target_metal} atom records."
+        )
+
+        for match in matches:
+
+            print()
+            print(
+                f"MAE line : "
+                f"{match['line_number']}"
+            )
+
+            print(
+                f"Atom ID  : "
+                f"{match['atomid']}"
+            )
+
+            print(
+                match["line"]
+            )
+
+        raise ValueError(
+            f"\nThere should be exactly one "
+            f"{target_metal} atom."
+        )
+
+    # ========================================================
+    # EXACTLY ONE CU
+    # ========================================================
+
+    match = matches[0]
+
+    return (
+        match["atomid"],
+        match["line_number"],
+        match["line"]
+    )
+
+
+# ============================================================
+# MODIFY METAL_CONSTRAINTS
+# ============================================================
+
+def modify_metal_constraint(
+    input_file,
+    atomid,
+    metal_label="metal1",
+    make_backup=True
+):
+    """
+    Replace exactly one METAL_CONSTRAINTS line.
+
+    Example:
+
+        METAL_CONSTRAINTS   "metal1 2323",
+    """
+
+    input_file = Path(
+        input_file
+    )
+
+    if not input_file.exists():
+
+        raise FileNotFoundError(
+            f"\nConstraint file not found:\n"
+            f"{input_file}"
+        )
+
+    # --------------------------------------------------------
+    # Read input file
+    # --------------------------------------------------------
+
+    with open(
+        input_file,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        lines = f.readlines()
+
+    # --------------------------------------------------------
+    # Find METAL_CONSTRAINTS
+    # --------------------------------------------------------
+
+    constraint_indices = []
+
+    for i, line in enumerate(lines):
+
+        if line.lstrip().startswith(
+            "METAL_CONSTRAINTS"
+        ):
+
+            constraint_indices.append(i)
+
+    # --------------------------------------------------------
+    # No constraint line
+    # --------------------------------------------------------
+
+    if len(constraint_indices) == 0:
+
+        raise ValueError(
+            f"\nCould not find METAL_CONSTRAINTS in:\n"
+            f"{input_file}"
+        )
+
+    # --------------------------------------------------------
+    # Multiple constraint lines
+    # --------------------------------------------------------
+
+    if len(constraint_indices) > 1:
+
+        line_numbers = [
+            i + 1
+            for i in constraint_indices
+        ]
+
+        raise ValueError(
+            f"\nFound {len(constraint_indices)} "
+            f"METAL_CONSTRAINTS lines.\n"
+            f"Line numbers: {line_numbers}\n"
+            f"There should be exactly one."
+        )
+
+    # --------------------------------------------------------
+    # Backup
+    # --------------------------------------------------------
+
+    if make_backup:
+
+        backup_file = Path(
+            str(input_file) + ".bak"
+        )
+
+        shutil.copy2(
+            input_file,
+            backup_file
+        )
+
+        print()
+        print("Backup created:")
+        print(backup_file)
+
+    # --------------------------------------------------------
+    # Build new constraint
+    # --------------------------------------------------------
+
+    new_constraint = (
+        f"{metal_label} {atomid}"
+    )
+
+    # --------------------------------------------------------
+    # Replace line
+    # --------------------------------------------------------
+
+    i = constraint_indices[0]
+
+    original_line = lines[i]
+
+    indentation = original_line[
+        :len(original_line)
+        - len(original_line.lstrip())
+    ]
+
+    lines[i] = (
+        f'{indentation}'
+        f'METAL_CONSTRAINTS   '
+        f'"{new_constraint}",\n'
+    )
+
+    # --------------------------------------------------------
+    # Write modified file
+    # --------------------------------------------------------
+
+    with open(
+        input_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.writelines(lines)
+
+    return new_constraint
+
+
+# ============================================================
+# COMPLETE WORKFLOW
+# ============================================================
+
+def setup_metal_constraint(
+    folder,
+    mae_filename,
+    constraint_filename,
+    metal="CU",
+    metal_label="metal1",
+    make_backup=True
+):
+    """
+    Workflow:
+
+        MAE file
+           |
+           v
+        find atom line containing CU
+           |
+           v
+        first field = atom ID
+           |
+           v
+        modify METAL_CONSTRAINTS
+    """
+
+    folder = Path(folder)
+
+    print()
+    print("=" * 70)
+    print("GRID METAL CONSTRAINT SETUP")
+    print("=" * 70)
+
+    print(
+        f"Folder           : {folder}"
+    )
+
+    print(
+        f"Metal            : {metal}"
+    )
+
+    # ========================================================
+    # MAE FILE
+    # ========================================================
+
+    mae_file = resolve_single_file(
+        folder,
+        mae_filename
+    )
+
+    print(
+        f"MAE file         : {mae_file.name}"
+    )
+
+    # ========================================================
+    # FIND CU ATOM
+    # ========================================================
+
+    (
+        atomid,
+        line_number,
+        mae_line
+    ) = find_metal_atom_id_in_mae(
+        mae_file=mae_file,
+        metal=metal
+    )
+
+    print()
+    print("Metal atom found:")
+
+    print(
+        f"Atom ID          : {atomid}"
+    )
+
+    print(
+        f"MAE line number  : {line_number}"
+    )
+
+    print()
+    print("Matched MAE line:")
+
+    print(
+        mae_line
+    )
+
+    # ========================================================
+    # GLIDE INPUT FILE
+    # ========================================================
+
+    constraint_file = resolve_single_file(
+        folder,
+        constraint_filename
+    )
+
+    print()
+    print(
+        f"Constraint file  : "
+        f"{constraint_file.name}"
+    )
+
+    # ========================================================
+    # MODIFY METAL CONSTRAINT
+    # ========================================================
+
+    new_constraint = modify_metal_constraint(
+        input_file=constraint_file,
+        atomid=atomid,
+        metal_label=metal_label,
+        make_backup=make_backup
+    )
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
+    print()
+    print("=" * 70)
+    print("METAL CONSTRAINT UPDATED")
+    print("=" * 70)
+
+    print(
+        f'METAL_CONSTRAINTS   '
+        f'"{new_constraint}",'
+    )
+
+    print("=" * 70)
+    print()
+
+    return {
+        "metal": metal,
+        "atomid": atomid,
+        "mae_file": str(mae_file),
+        "mae_line_number": line_number,
+        "constraint_file": str(constraint_file),
+        "constraint": new_constraint
+    }
+
+
+# ============================================================
+# USER INPUT
+# ============================================================
+
+# Current working directory
+folder = os.getcwd()
+
+
+# ------------------------------------------------------------
+# Metal
+# ------------------------------------------------------------
+
+metal = "CU"
+
+
+# ------------------------------------------------------------
+# Glide metal constraint label
+# ------------------------------------------------------------
+
+metal_label = "metal1"
+
+
+# ------------------------------------------------------------
+# MAE file
+#
+# Exact filename is safest:
+#
+# mae_filename = "converted.mae"
+#
+# Or wildcard if exactly one .mae exists:
+# ------------------------------------------------------------
+
+mae_filename = "*.mae"
+
+
+# ------------------------------------------------------------
+# Glide input file
+#
+# Exact filename is safest:
+#
+# constraint_filename = "grid.in"
+#
+# Or wildcard if exactly one .in exists:
+# ------------------------------------------------------------
+
+constraint_filename = "*.in"
+
+
+# ------------------------------------------------------------
+# Backup before modification
+# ------------------------------------------------------------
+
+make_backup = True
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+result = setup_metal_constraint(
+    folder=folder,
+    mae_filename=mae_filename,
+    constraint_filename=constraint_filename,
+    metal=metal,
+    metal_label=metal_label,
+    make_backup=make_backup
+)
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+print()
+print("Final results:")
+print("Metal   :", result["metal"])
+print("Atom ID :", result["atomid"])
