@@ -1,0 +1,92 @@
+#!/bin/bash
+#SBATCH --job-name=or51_gate_distances
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm_logs/%x-%j.out
+#SBATCH --error=slurm_logs/%x-%j.err
+
+# Put gate_distances.py and this file in ~/OR51_gate. Submit from there:
+#   mkdir -p slurm_logs
+#   sbatch gate_distances.slurm
+# The log directory must exist BEFORE submitting the job.
+# Optional input check: sbatch gate_distances.slurm --dry-run
+# Replace previous results: sbatch gate_distances.slurm --overwrite
+# Add pooled CSVs/plots for each setup: sbatch gate_distances.slurm --combine-runs
+# If distance CSVs already exist, avoid rereading trajectories:
+#   sbatch gate_distances.slurm --plot-only --combine-runs
+# Every saved frame is plotted; combining simply collects all five CSVs' rows.
+# Individual *_gate_2d plots are also written for each trajectory.
+# Plot-only refreshes plots/combined outputs without needing --overwrite and
+# preserves the original measurement CSVs, summary.csv, and manifest.json.
+# Existing combined outputs are refreshed even if --combine-runs is omitted.
+# Plot-only inherits PBC and dt from manifest.json; conflicting flags are rejected.
+# Add --dt-ns VALUE only when the physical interval between saved frames is known.
+# Otherwise, plots use frame index; original XTC timestamps are retained in tables.
+
+set -euo pipefail
+
+PROJECT_DIR="${OR51_GATE_DIR:-$HOME/OR51_gate}"
+OR51_VENV_DIR="${OR51_GATE_VENV:-$HOME/venvs/or_gate_py311}"
+OR51_PYTHON="$OR51_VENV_DIR/bin/python"
+cd "$PROJECT_DIR"
+
+# Use the working Python 3.11 environment directly, without module loading.
+unset PYTHONHOME PYTHONPATH
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+export MPLBACKEND=Agg
+
+echo "Job: ${SLURM_JOB_ID:-local} | Host: $(hostname)"
+echo "Project: $PROJECT_DIR"
+echo "Environment Python: $OR51_PYTHON"
+date
+
+# Check the allocated node before reading trajectories or creating results.
+if ! "$OR51_PYTHON" -u - <<'PY'
+import sys
+from pathlib import Path
+
+print("Python:", sys.version.split()[0])
+print("Executable:", sys.executable)
+print("Environment:", sys.prefix)
+print("Base Python:", sys.base_prefix)
+if sys.prefix == sys.base_prefix:
+    raise RuntimeError("The selected interpreter is not running in a virtual environment.")
+config = Path(sys.prefix) / "pyvenv.cfg"
+settings = dict(line.split("=", 1) for line in config.read_text().splitlines() if "=" in line)
+settings = {key.strip(): value.strip() for key, value in settings.items()}
+created_version = settings.get("version", "")
+if created_version and tuple(map(int, created_version.split(".")[:2])) != sys.version_info[:2]:
+    raise RuntimeError(f"Environment was created with Python {created_version}, "
+                       f"but this node runs {sys.version.split()[0]}.")
+import numpy
+import mdtraj
+import matplotlib
+import pandas
+from mdtraj.formats import XTCTrajectoryFile
+print("NumPy:", numpy.__version__, "| MDTraj:", mdtraj.__version__,
+      "| Matplotlib:", matplotlib.__version__, "| pandas:", pandas.__version__)
+print("Environment check passed.")
+PY
+then
+    echo "ERROR: the gate-analysis environment cannot run correctly on this CPU node." >&2
+    echo "See the error above. Environment configuration and interpreter links:"
+    cat "$OR51_VENV_DIR/pyvenv.cfg" 2>/dev/null || true
+    ls -l "$OR51_VENV_DIR/bin/python" "$OR51_VENV_DIR/bin/python3" 2>/dev/null || true
+    exit 1
+fi
+
+"$OR51_PYTHON" -u "$PROJECT_DIR/gate_distances.py" \
+    --input-root "$PROJECT_DIR/Stripped_Trajs" \
+    --output-root "$PROJECT_DIR/Gate_Distances" \
+    --chunk 100 \
+    "$@"
+
+date
+echo "Gate-distance job finished."

@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""Extract two OR51E2 distances from every saved frame and make comparison plots.
+
+Defaults (run from ~/OR51_gate):
+  Stripped_Trajs/{OR51E2_C3,OR51E2_C3_vs_C7,OR51E2_C7}/
+    step5_input_nowater.pdb and five run*-skip100_nowater.xtc files
+  Outputs: Gate_Distances/<setup>/*_distances.csv, timeseries.{png,pdf},
+    gate_2d_by_run.{png,pdf}; comparison_2d.{png,pdf}, summary.csv, manifest.json.
+
+d_Q181_R262_A = min(Q181 OE1/NE2, R262 NH1/NH2), four atom pairs.
+  Allosteric Gating Mechanism..., Methods: Gate distance and odorant association
+  distances. DOI: 10.64898/2026.07.06.736896.
+d_G198_R262_A = min(G198 N/CA/C/O, R262 CB/CG/CD/NE/CZ/NH1/NH2), 28 pairs.
+  Billesbolle et al., Nature (2023), Fig. 5c and Supplementary Table 5.
+  DOI: 10.1038/s41586-023-05798-y.
+
+Residue identifiers are PDB resSeq numbers, NOT zero-based MDTraj indices.
+The second residue is G198, correcting the earlier reference to residue 191.
+Minimum-image periodic distances are used by default (requires valid XTC boxes).
+No alignment, centering, smoothing, thresholding, or frame subsampling is applied
+to the exported measurements. The two protein distances do not identify ligand
+occupancy or prove metastability. Histograms count saved frames in each bin.
+Runs retain their identities. Every CSV row is included in the plots.
+--combine-runs adds one combined CSV, a two-panel distance map, and overlaid time
+traces for EACH setup. It does not join runs into a continuous trajectory.
+Combining means concatenating the five runs' rows without averaging or reweighting.
+Each run also gets its own *_gate_2d.png and .pdf plot.
+--plot-only rebuilds plots/combined tables from existing per-run CSVs after
+checking the completed manifest. No input PDB/XTC files are needed. Existing
+measurement CSVs, summary.csv, and manifest.json are not changed. Plot-only
+inherits PBC and dt from that manifest; explicit conflicting flags are rejected.
+Existing combined outputs are automatically refreshed whenever plots are rebuilt.
+
+Time-series x axes use saved frame index by default. Raw XTC timestamps/steps are
+preserved in CSVs but are NOT assumed to reflect the original simulation clock.
+Only use --dt-ns when the physical interval between SAVED frames is established;
+it gives elapsed time = frame_index * dt_ns, reset to zero for each trajectory.
+
+Examples:
+  python gate_distances.py --dry-run
+  python gate_distances.py
+  python gate_distances.py --overwrite
+  python gate_distances.py --plot-only --combine-runs
+Dependencies: MDTraj, NumPy, pandas, Matplotlib; compatible with Python 3.11.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+from itertools import product
+import json
+from pathlib import Path
+import re
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+import mdtraj as md
+from mdtraj.formats import XTCTrajectoryFile
+import numpy as np
+import pandas as pd
+
+
+SETUPS = ["OR51E2_C3", "OR51E2_C3_vs_C7", "OR51E2_C7"]
+D1 = "d_Q181_R262_A"
+D2 = "d_G198_R262_A"
+XLABEL = "Q181–R262 minimum distance (Å)"
+YLABEL = "G198–R262 minimum distance (Å)"
+SPEC = {
+    "Q181_polar": (181, "GLN", ("OE1", "NE2")),
+    "G198_backbone": (198, "GLY", ("N", "CA", "C", "O")),
+    "R262_terminal": (262, "ARG", ("NH1", "NH2")),
+    "R262_sidechain": (262, "ARG", ("CB", "CG", "CD", "NE", "CZ", "NH1", "NH2")),
+}
+DEFINITIONS = {D1: "min(Q181{OE1,NE2},R262{NH1,NH2})",
+               D2: "min(G198{N,CA,C,O},R262{CB,CG,CD,NE,CZ,NH1,NH2})"}
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def natural_key(path: Path):
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)]
+
+
+def valid_boxes(boxes, n_frames: int) -> bool:
+    return (boxes is not None and boxes.shape == (n_frames, 3, 3)
+            and bool(np.isfinite(boxes).all())
+            and bool((np.linalg.det(boxes.astype(np.float64)) > 1e-9).all()))
+
+
+def select_gate_atoms(topology, chain_id: str | None):
+    candidates = []
+    for chain in topology.chains:
+        if chain_id is not None and chain.chain_id != chain_id:
+            continue
+        matches = {
+            (number, name): [r for r in chain.residues if r.resSeq == number and r.name == name]
+            for number, name in {(s[0], s[1]) for s in SPEC.values()}
+        }
+        if all(len(residues) == 1 for residues in matches.values()):
+            candidates.append((chain, matches))
+    if len(candidates) != 1:
+        found = [(c.index, c.chain_id) for c, _ in candidates]
+        raise ValueError(
+            "Expected one receptor chain containing GLN181, GLY198, and ARG262 "
+            f"by PDB resSeq; found {found}. Check numbering or use --chain-id."
+        )
+    chain, matches = candidates[0]
+    groups, details = {}, {}
+    for group, (number, name, atom_names) in SPEC.items():
+        residue = matches[(number, name)][0]
+        selected = []
+        for atom_name in atom_names:
+            atoms = [a for a in residue.atoms if a.name == atom_name]
+            if len(atoms) != 1:
+                raise ValueError(f"{name}{number}: expected one {atom_name} atom, got {len(atoms)}")
+            selected.append(atoms[0].index)
+        groups[group] = selected
+        details[group] = {"resSeq": number, "resname": name,
+                          "atom_names": list(atom_names), "atom_indices_zero_based": selected}
+    keep = np.array(sorted({i for group in groups.values() for i in group}), dtype=np.int32)
+    lookup = {int(original): i for i, original in enumerate(keep)}
+    pairs = list(product(groups["Q181_polar"], groups["R262_terminal"]))
+    pairs += list(product(groups["G198_backbone"], groups["R262_sidechain"]))
+    local_pairs = np.array([[lookup[a], lookup[b]] for a, b in pairs], dtype=np.int32)
+    details["chain"] = {"index_zero_based": chain.index, "id": chain.chain_id}
+    return keep, local_pairs, details
+
+
+@dataclass
+class Setup:
+    name: str
+    pdb: Path
+    xtcs: list[Path]
+    n_atoms: int
+    keep: np.ndarray
+    pairs: np.ndarray
+    small_topology: md.Topology
+    selection: dict
+
+
+def preflight(args) -> list[Setup]:
+    source = args.input_root.expanduser().resolve()
+    destination = args.output_root.expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"Input folder does not exist: {source}")
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError("Input/output roots must be separate, non-nested folders.")
+    if destination.exists() and not destination.is_dir():
+        raise ValueError(f"Output path is not a directory: {destination}")
+    if (destination.is_dir() and any(destination.iterdir())
+            and not args.overwrite and not args.dry_run):
+        raise ValueError(f"Output folder is not empty: {destination}; use --overwrite to replace results.")
+    setups = []
+    for name in args.setups:
+        if Path(name).name != name or name in {".", ".."}:
+            raise ValueError(f"Expected a setup folder name, got {name!r}")
+        folder = source / name
+        pdb = folder / "step5_input_nowater.pdb"
+        if not pdb.is_file():
+            raise ValueError(f"Missing topology: {pdb}")
+        xtcs = sorted(folder.glob("run*-skip100_nowater.xtc"), key=natural_key)
+        if not xtcs or (args.expected_runs and len(xtcs) != args.expected_runs):
+            raise ValueError(f"{name}: found {len(xtcs)} matching XTCs; expected {args.expected_runs}.")
+        reference = md.load_pdb(str(pdb), standard_names=False, no_boxchk=True)
+        if reference.n_frames != 1:
+            raise ValueError(f"Expected a single-frame topology PDB: {pdb}")
+        keep, pairs, selection = select_gate_atoms(reference.topology, args.chain_id)
+        for xtc in xtcs:
+            with XTCTrajectoryFile(str(xtc), "r") as reader:
+                xyz, _, _, boxes = reader.read(n_frames=1)
+            if len(xyz) == 0:
+                raise ValueError(f"Empty trajectory: {xtc}")
+            if xyz.shape[1] != reference.n_atoms:
+                raise ValueError(f"Atom-count mismatch: {xtc.name} has {xyz.shape[1]}, "
+                                 f"but {pdb.name} has {reference.n_atoms} atoms.")
+            if not np.isfinite(xyz[:, keep, :]).all():
+                raise ValueError(f"Non-finite gate coordinates: {xtc}")
+            if not args.no_pbc and not valid_boxes(boxes, len(xyz)):
+                raise ValueError(f"Missing/invalid periodic box: {xtc}. Use --no-pbc only "
+                                 "if the receptor is known to be whole across all frames.")
+        log(f"{name}: {len(xtcs)} trajectories, {reference.n_atoms:,} atoms; "
+            f"receptor chain {selection['chain']['id']!r}, "
+            f"{len(keep)} selected atoms, 4 + 28 atom pairs")
+        setups.append(Setup(name, pdb, xtcs, reference.n_atoms, keep, pairs,
+                            reference.topology.subset(keep), selection))
+    return setups
+
+
+def load_measured_results(args) -> tuple[dict, dict]:
+    """Read only CSVs recorded by a scientifically compatible completed analysis."""
+    output = args.output_root.expanduser().resolve()
+    manifest_path = output / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"Plot-only needs the completed extraction manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    if (not isinstance(manifest, dict) or manifest.get("status") != "complete"
+            or manifest.get("distance_units") != "angstrom"
+            or manifest.get("definitions") != DEFINITIONS):
+        raise ValueError("Manifest is incomplete or has different distance definitions/units.")
+    periodic = manifest.get("periodic_minimum_image")
+    if not isinstance(periodic, bool):
+        raise ValueError("Manifest must specify periodic_minimum_image as true or false.")
+    if args.no_pbc is True and periodic:
+        raise ValueError("--no-pbc conflicts with the existing minimum-image measurements.")
+    args.no_pbc = not periodic
+    time_metadata = manifest.get("time")
+    if not isinstance(time_metadata, dict) or "physical_saved_frame_interval_ns" not in time_metadata:
+        raise ValueError("Manifest is missing the physical saved-frame interval metadata.")
+    dt_ns = time_metadata["physical_saved_frame_interval_ns"]
+    if dt_ns is not None and (isinstance(dt_ns, bool) or not isinstance(dt_ns, (int, float))
+                              or not np.isfinite(dt_ns) or dt_ns <= 0):
+        raise ValueError("Manifest has an invalid physical saved-frame interval.")
+    if args.dt_ns is not None and (dt_ns is None or not np.isclose(args.dt_ns, dt_ns, rtol=1e-12, atol=0)):
+        raise ValueError("--dt-ns conflicts with the existing manifest; plot-only preserves its time interpretation.")
+    args.dt_ns = dt_ns
+    recorded_setups = manifest.get("setups")
+    if not isinstance(recorded_setups, dict):
+        raise ValueError("Manifest is missing setup provenance.")
+    results = {}
+    for name in args.setups:
+        if Path(name).name != name or name in {".", ".."}:
+            raise ValueError(f"Expected a setup folder name, got {name!r}")
+        metadata = recorded_setups.get(name)
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("selection"), dict):
+            raise ValueError(f"{name}: manifest is missing the original atom selection.")
+        selection = metadata["selection"]
+        for group, (number, residue, atoms) in SPEC.items():
+            chosen = selection.get(group)
+            if (not isinstance(chosen, dict) or chosen.get("resSeq") != number
+                    or chosen.get("resname") != residue or chosen.get("atom_names") != list(atoms)):
+                raise ValueError(f"{name}: manifest atom selection does not match {group}.")
+            indices = chosen.get("atom_indices_zero_based")
+            if (not isinstance(indices, list) or len(indices) != len(atoms)
+                    or any(type(i) is not int or i < 0 for i in indices)
+                    or len(set(indices)) != len(indices)):
+                raise ValueError(f"{name}: invalid original atom indices for {group}.")
+        if (selection["R262_terminal"]["atom_indices_zero_based"]
+                != selection["R262_sidechain"]["atom_indices_zero_based"][-2:]):
+            raise ValueError(f"{name}: inconsistent R262 atom indices in manifest.")
+        distinct = [i for group in ("Q181_polar", "G198_backbone", "R262_sidechain")
+                    for i in selection[group]["atom_indices_zero_based"]]
+        if len(set(distinct)) != 13:
+            raise ValueError(f"{name}: overlapping residue atom selections in manifest.")
+        chain = selection.get("chain")
+        if (not isinstance(chain, dict) or "id" not in chain
+                or type(chain.get("index_zero_based")) is not int or chain["index_zero_based"] < 0):
+            raise ValueError(f"{name}: manifest is missing receptor chain provenance.")
+        if args.chain_id is not None and args.chain_id != chain["id"]:
+            raise ValueError(f"{name}: --chain-id conflicts with the original selection.")
+        paths = metadata.get("trajectories")
+        if not isinstance(paths, list) or not paths or any(not isinstance(p, str) for p in paths):
+            raise ValueError(f"{name}: missing trajectory inventory in manifest.")
+        trajectories = [Path(p) for p in paths]
+        if len({p.name for p in trajectories}) != len(trajectories):
+            raise ValueError(f"{name}: duplicate trajectories in manifest.")
+        if args.expected_runs and len(trajectories) != args.expected_runs:
+            raise ValueError(f"{name}: manifest has {len(trajectories)} runs; expected {args.expected_runs}.")
+        results[name] = []
+        for xtc in trajectories:
+            csv = output / name / f"{xtc.stem}_distances.csv"
+            table = pd.read_csv(csv)
+            required = ["frame", "stored_time_ps", "stored_step", D1, D2]
+            if dt_ns is not None:
+                required.append("elapsed_time_ns")
+            if table.empty or set(table.columns) != set(required):
+                raise ValueError(f"{csv}: empty table or columns inconsistent with the manifest.")
+            for column in required:
+                table[column] = pd.to_numeric(table[column], errors="raise")
+            if not np.isfinite(table[required].to_numpy()).all():
+                raise ValueError(f"{csv}: non-finite measurements or frame/time identifiers.")
+            if not np.array_equal(table["frame"].to_numpy(), np.arange(len(table))):
+                raise ValueError(f"{csv}: frame indices must run from zero without gaps within each run.")
+            if ((table[[D1, D2]] < 0).any().any()
+                    or not np.equal(table["stored_step"], np.floor(table["stored_step"])).all()):
+                raise ValueError(f"{csv}: invalid distances or non-integer stored steps.")
+            if dt_ns is not None and not np.allclose(table["elapsed_time_ns"],
+                                                    table["frame"] * dt_ns, rtol=1e-8, atol=1e-10):
+                raise ValueError(f"{csv}: elapsed time does not match the manifest's saved-frame interval.")
+            results[name].append((xtc, table))
+        log(f"{name}: validated {len(trajectories)} existing per-run CSVs; chain {chain['id']!r}")
+    return results, manifest
+
+
+def measure(xtc: Path, setup: Setup, args) -> pd.DataFrame:
+    pieces = []
+    n_done = 0
+    with XTCTrajectoryFile(str(xtc), "r") as reader:
+        while True:
+            xyz, times, steps, boxes = reader.read(n_frames=args.chunk, atom_indices=setup.keep)
+            if len(xyz) == 0:
+                break
+            if not np.isfinite(xyz).all():
+                raise ValueError(f"Non-finite selected coordinates in {xtc} near frame {n_done}")
+            trajectory = md.Trajectory(xyz, setup.small_topology)
+            if not args.no_pbc:
+                if not valid_boxes(boxes, len(xyz)):
+                    raise ValueError(f"Missing/invalid periodic box in {xtc} near frame {n_done}")
+                trajectory.unitcell_vectors = boxes
+            # MDTraj coordinates/distances are in nm. Export and plot in angstroms.
+            pair_distances = md.compute_distances(trajectory, setup.pairs,
+                                                  periodic=not args.no_pbc) * 10.0
+            data = {
+                "frame": np.arange(n_done, n_done + len(xyz), dtype=np.int64),
+                "stored_time_ps": times,
+                "stored_step": steps,
+                D1: pair_distances[:, :4].min(axis=1),
+                D2: pair_distances[:, 4:].min(axis=1),
+            }
+            if args.dt_ns is not None:
+                data["elapsed_time_ns"] = data["frame"] * args.dt_ns
+            pieces.append(pd.DataFrame(data))
+            n_done += len(xyz)
+            if n_done % (10 * args.chunk) == 0:
+                log(f"  {xtc.name}: {n_done:,} frames")
+    if not pieces:
+        raise ValueError(f"No frames in {xtc}")
+    result = pd.concat(pieces, ignore_index=True)
+    log(f"  {xtc.name}: {len(result):,} frames; "
+        f"Q181–R262 {result[D1].min():.2f}–{result[D1].max():.2f} Å; "
+        f"G198–R262 {result[D2].min():.2f}–{result[D2].max():.2f} Å")
+    return result
+
+
+def write_csv(dataframe: pd.DataFrame, destination: Path) -> None:
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        dataframe.to_csv(temporary, index=False, float_format="%.9g")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_json(data: dict, destination: Path) -> None:
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2) + "\n")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def save_figure(figure, stem: Path, dpi: int) -> None:
+    for suffix in ("png", "pdf"):
+        figure.savefig(stem.with_suffix("." + suffix), dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def display_name(path: Path) -> str:
+    match = re.match(r"run(\d+)", path.name)
+    return f"Run {match.group(1)}" if match else path.stem
+
+
+def padded_range(arrays: list[np.ndarray]) -> tuple[float, float]:
+    low = min(float(a.min()) for a in arrays)
+    high = max(float(a.max()) for a in arrays)
+    padding = max((high - low) * 0.04, 0.15)
+    return max(0.0, low - padding), high + padding
+
+
+def pooled_table(name: str, runs: list) -> pd.DataFrame:
+    """Concatenate all rows, retaining source trajectory and frame identifiers."""
+    pieces = []
+    for xtc, table in runs:
+        piece = table.copy()
+        piece.insert(0, "trajectory", xtc.name)
+        piece.insert(0, "setup", name)
+        pieces.append(piece)
+    return pd.concat(pieces, ignore_index=True)
+
+
+def combined_plots(name, runs, pooled, histogram, folder, args,
+                   xlim, ylim, xedges, yedges, cmap, norm):
+    colors = plt.get_cmap("tab10")
+    figure, axes = plt.subplots(1, 2, figsize=(12.4, 4.8), sharex=True, sharey=True,
+                                layout="constrained")
+    for index, (xtc, table) in enumerate(runs):
+        axes[0].scatter(table[D1], table[D2],
+                        color=colors(index % 10), label=f"{display_name(xtc)} (n={len(table):,})",
+                        s=7, alpha=0.45, linewidths=0, rasterized=True)
+    axes[0].legend(loc="best", markerscale=2, fontsize=8, framealpha=0.9)
+    axes[0].set_title("All runs · colored by run")
+    axes[0].grid(alpha=0.13)
+    mesh = axes[1].pcolormesh(xedges, yedges, np.ma.masked_where(histogram.T == 0, histogram.T),
+                              cmap=cmap, norm=norm, shading="flat", rasterized=True)
+    axes[1].set_title("All runs · frame counts")
+    for ax in axes:
+        ax.set(xlim=xlim, ylim=ylim, xlabel=XLABEL)
+    axes[0].set_ylabel(YLABEL)
+    figure.colorbar(mesh, ax=axes[1], label="Frames per bin", shrink=0.85)
+    figure.suptitle(f"{name} · {len(runs)} runs; {len(pooled):,} saved frames", fontsize=13)
+    save_figure(figure, folder / "gate_2d_combined", args.dpi)
+
+    figure, axes = plt.subplots(1, 2, figsize=(12.4, 4.4), sharex=True, layout="constrained")
+    max_x = 0.0
+    for index, (xtc, table) in enumerate(runs):
+        x = table["frame"] if args.dt_ns is None else table["elapsed_time_ns"]
+        max_x = max(max_x, float(x.max()))
+        for ax, column in zip(axes, (D1, D2)):
+            ax.plot(x, table[column], color=colors(index % 10), linewidth=0.65,
+                     alpha=0.72, label=display_name(xtc),
+                     marker="o" if len(table) == 1 else None, markersize=3)
+    for ax, title, limits in zip(axes, ("Q181–R262", "G198–R262"), (xlim, ylim)):
+        ax.set(title=title, xlim=(0, max(max_x, 1e-6)), ylim=limits, ylabel="Distance (Å)")
+        ax.grid(alpha=0.18)
+    axes[1].legend(loc="best", fontsize=8, framealpha=0.9)
+    figure.supxlabel("Saved frame index within each run (0-based)" if args.dt_ns is None
+                     else "Elapsed time from each run's first saved frame (ns)")
+    figure.suptitle(f"{name} · independent runs overlaid", fontsize=13)
+    save_figure(figure, folder / "timeseries_combined", args.dpi)
+
+
+def make_plots(results: dict, output: Path, args) -> dict:
+    all_tables = [table for runs in results.values() for _, table in runs]
+    xlim = padded_range([table[D1].to_numpy() for table in all_tables])
+    ylim = padded_range([table[D2].to_numpy() for table in all_tables])
+    xedges = np.linspace(*xlim, args.bins + 1)
+    yedges = np.linspace(*ylim, args.bins + 1)
+    plt.rcParams.update({"font.size": 10, "axes.spines.top": False,
+                         "axes.spines.right": False, "pdf.fonttype": 42,
+                         "agg.path.chunksize": 10000})
+    histograms, pooled_tables = {}, {}
+    for name, runs in results.items():
+        combined = pooled_table(name, runs)
+        pooled_tables[name] = combined
+        counts, _, _ = np.histogram2d(combined[D1], combined[D2], bins=(xedges, yedges))
+        histograms[name] = counts
+    norm = Normalize(vmin=0, vmax=max(float(h.max()) for h in histograms.values()))
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("#f5f6f7")
+    figure, axes = plt.subplots(1, len(results), figsize=(5.0 * len(results), 4.6),
+                                squeeze=False, sharex=True, sharey=True, layout="constrained")
+    for ax, (name, runs) in zip(axes[0], results.items()):
+        h = histograms[name]
+        mesh = ax.pcolormesh(xedges, yedges, np.ma.masked_where(h.T == 0, h.T),
+                             cmap=cmap, norm=norm, shading="flat", rasterized=True)
+        ax.set_title(f"{name}\n{len(runs)} runs; {sum(len(t) for _, t in runs):,} frames")
+        ax.set(xlim=xlim, ylim=ylim, xlabel=XLABEL)
+    axes[0, 0].set_ylabel(YLABEL)
+    figure.colorbar(mesh, ax=list(axes[0]), label="Frames per bin", shrink=0.85)
+    figure.suptitle("Gate distances · all saved frames within each setup",
+                    fontsize=13)
+    save_figure(figure, output / "comparison_2d", args.dpi)
+
+    for name, runs in results.items():
+        folder = output / name
+        n_runs = len(runs)
+        # Plot each trajectory separately, so no line connects independent runs.
+        figure, axes = plt.subplots(n_runs, 2, figsize=(12.0, max(3.0, 1.85 * n_runs)),
+                                    squeeze=False, sharex=True, layout="constrained")
+        max_x = 0.0
+        for row, (xtc, table) in enumerate(runs):
+            x = table["frame"] if args.dt_ns is None else table["elapsed_time_ns"]
+            max_x = max(max_x, float(x.max()))
+            for col, (column, color, limits) in enumerate(((D1, "#2368a2", xlim),
+                                                         (D2, "#b6532c", ylim))):
+                ax = axes[row, col]
+                ax.plot(x, table[column], color=color, linewidth=0.65)
+                ax.set_ylim(*limits)
+                ax.grid(alpha=0.18)
+                if col == 0:
+                    ax.set_ylabel(f"{display_name(xtc)}\nDistance (Å)")
+        axes[0, 0].set_title("Q181–R262")
+        axes[0, 1].set_title("G198–R262")
+        for ax in axes.flat:
+            ax.set_xlim(0, max(max_x, 1e-6))
+        figure.supxlabel("Saved frame index (0-based)" if args.dt_ns is None
+                         else "Elapsed time from first saved frame (ns)")
+        figure.suptitle(f"{name} · individual trajectories", fontsize=13)
+        save_figure(figure, folder / "timeseries", args.dpi)
+
+        figure, axes = plt.subplots(1, n_runs, figsize=(3.25 * n_runs + 0.7, 3.7),
+                                    squeeze=False, sharex=True, sharey=True, layout="constrained")
+        for ax, (xtc, table) in zip(axes[0], runs):
+            indices = np.arange(len(table))
+            scatter = ax.scatter(table[D1].to_numpy()[indices], table[D2].to_numpy()[indices],
+                                  c=indices / max(len(table) - 1, 1), cmap="viridis",
+                                  vmin=0, vmax=1, s=5, alpha=0.6, linewidths=0, rasterized=True)
+            ax.set(xlim=xlim, ylim=ylim)
+            ax.set_title(f"{display_name(xtc)}\n{len(table):,} frames")
+            ax.grid(alpha=0.13)
+        axes[0, 0].set_ylabel(YLABEL)
+        figure.supxlabel(XLABEL)
+        figure.colorbar(scatter, ax=list(axes[0]), label="Relative frame position (start → end)",
+                        shrink=0.85, ticks=[0, 0.5, 1])
+        figure.suptitle(name, fontsize=13)
+        save_figure(figure, folder / "gate_2d_by_run", args.dpi)
+        # One standalone 2D plot for every trajectory's distance CSV.
+        for xtc, table in runs:
+            figure, ax = plt.subplots(figsize=(6.2, 5.0), layout="constrained")
+            positions = np.arange(len(table)) / max(len(table) - 1, 1)
+            scatter = ax.scatter(table[D1], table[D2], c=positions, cmap="viridis",
+                                 vmin=0, vmax=1, s=7, alpha=0.6, linewidths=0, rasterized=True)
+            ax.set(xlim=xlim, ylim=ylim, xlabel=XLABEL, ylabel=YLABEL,
+                   title=f"{name} · {display_name(xtc)}\n{len(table):,} saved frames")
+            ax.grid(alpha=0.13)
+            figure.colorbar(scatter, ax=ax, label="Relative frame position (start → end)",
+                            shrink=0.85, ticks=[0, 0.5, 1])
+            save_figure(figure, folder / f"{xtc.stem}_gate_2d", args.dpi)
+        if args.combine_runs:
+            write_csv(pooled_tables[name], folder / "combined_distances.csv")
+            combined_plots(name, runs, pooled_tables[name], histograms[name], folder, args,
+                           xlim, ylim, xedges, yedges, cmap, norm)
+    return {"x_limits_A": xlim, "y_limits_A": ylim, "bins_per_axis": args.bins,
+            "histogram_values": "Number of saved frames per bin; every row counted once",
+            "combined_outputs_requested": getattr(args, "combine_runs_requested", args.combine_runs),
+            "combined_outputs_written": args.combine_runs,
+            "combination": "Concatenate all rows within each setup, retaining source trajectory and frame",
+            "csv_and_plot_frames": "All frames, without subsampling"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-root", type=Path, default=Path("Stripped_Trajs"))
+    parser.add_argument("--output-root", type=Path, default=Path("Gate_Distances"))
+    parser.add_argument("--setups", nargs="+", default=SETUPS)
+    parser.add_argument("--expected-runs", type=int, default=5,
+                        help="Expected XTCs per setup; 0 accepts any nonzero count")
+    parser.add_argument("--chain-id", help="Optional PDB chain ID; default automatically finds the receptor")
+    parser.add_argument("--chunk", type=int, default=100)
+    parser.add_argument("--bins", type=int, default=60)
+    parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument("--dt-ns", type=float,
+                        help="Known physical interval between saved frames, in ns; otherwise plot frame index")
+    parser.add_argument("--no-pbc", action="store_true",
+                        default=None,
+                        help="Use ordinary distances only if the receptor is whole across all frames")
+    parser.add_argument("--combine-runs", action="store_true",
+                        help="Add per-setup pooled CSVs, combined 2D plots, and overlaid traces")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Rebuild plots from existing per-run CSVs/manifest; do not read trajectories")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+    args.combine_runs_requested = args.combine_runs
+    if min(args.chunk, args.bins, args.dpi) < 1 or args.expected_runs < 0:
+        parser.error("Chunk, bins, and dpi must be positive; expected-runs must be >=0")
+    if len(set(args.setups)) != len(args.setups):
+        parser.error("Setup names must be unique")
+    if args.dt_ns is not None and (not np.isfinite(args.dt_ns) or args.dt_ns <= 0):
+        parser.error("--dt-ns must be finite and positive")
+    try:
+        log(f"Python {sys.version.split()[0]}; MDTraj {md.__version__}")
+        log("Axes: Q181–R262 polar minimum; G198–R262 backbone/sidechain heavy-atom minimum (Å)")
+        output = args.output_root.expanduser().resolve()
+        # Refresh prior combined outputs along with individual plots.
+        combined_names = ("combined_distances.csv", "gate_2d_combined.png", "gate_2d_combined.pdf",
+                          "timeseries_combined.png", "timeseries_combined.pdf")
+        if not args.combine_runs and any((output / name / filename).exists()
+                                         for name in args.setups for filename in combined_names):
+            args.combine_runs = True
+            log("Existing combined outputs found; these will also be refreshed.")
+        if args.plot_only:
+            results, original_manifest = load_measured_results(args)
+            log("PBC recorded in measurements: " + ("disabled" if args.no_pbc else "minimum image"))
+            if args.dry_run:
+                log("Plot-only dry run passed: manifest and CSVs validated; no outputs written.")
+                return 0
+            plotting = make_plots(results, output, args)
+            write_json({
+                "status": "complete", "mode": "plot-only",
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "source_manifest": str(output / "manifest.json"),
+                "source_manifest_sha256": hashlib.sha256((output / "manifest.json").read_bytes()).hexdigest(),
+                "measurement_metadata_unchanged": True,
+                "setups": list(results), "periodic_minimum_image": not args.no_pbc,
+                "time": original_manifest["time"], "definitions": DEFINITIONS,
+                "plotting": plotting,
+            }, output / "plotting_manifest.json")
+            log(f"Rebuilt plots for {len(results)} setups from existing CSVs. Results: {output}")
+            return 0
+        args.no_pbc = bool(args.no_pbc)
+        log("PBC: " + ("disabled" if args.no_pbc else "minimum image"))
+        setups = preflight(args)
+        if args.dry_run:
+            log("Dry run passed: atom selections, run counts, and first frames checked; no outputs written.")
+            return 0
+        output.mkdir(parents=True, exist_ok=True)
+        manifest_path = output / "manifest.json"
+        manifest_path.unlink(missing_ok=True)
+        (output / "plotting_manifest.json").unlink(missing_ok=True)
+        results, summary_rows = {}, []
+        for setup in setups:
+            folder = output / setup.name
+            folder.mkdir(parents=True, exist_ok=True)
+            results[setup.name] = []
+            for xtc in setup.xtcs:
+                table = measure(xtc, setup, args)
+                write_csv(table, folder / f"{xtc.stem}_distances.csv")
+                results[setup.name].append((xtc, table))
+                row = {"setup": setup.name, "trajectory": xtc.name, "frames": len(table),
+                       "first_stored_time_ps": float(table.stored_time_ps.iloc[0]),
+                       "last_stored_time_ps": float(table.stored_time_ps.iloc[-1])}
+                for column in (D1, D2):
+                    for statistic in ("mean", "median", "min", "max"):
+                        row[f"{column}_{statistic}"] = float(getattr(table[column], statistic)())
+                summary_rows.append(row)
+        write_csv(pd.DataFrame(summary_rows), output / "summary.csv")
+        log("Drawing plots with common distance ranges across all setups and runs...")
+        plotting = make_plots(results, output, args)
+        manifest = {
+            "status": "complete", "python_version": sys.version.split()[0],
+            "mdtraj_version": md.__version__, "input_root": str(args.input_root.expanduser().resolve()),
+            "distance_units": "angstrom", "periodic_minimum_image": not args.no_pbc,
+            "definitions": DEFINITIONS,
+            "sources": ["10.64898/2026.07.06.736896, Methods: Gate distance and odorant association distances",
+                        "10.1038/s41586-023-05798-y, Fig. 5c and Supplementary Table 5"],
+            "frame_indices": "Zero-based within each input XTC; never joined across runs",
+            "time": {"stored_values": "XTC time and step exported without reinterpretation",
+                     "physical_saved_frame_interval_ns": args.dt_ns},
+            "interpretation": "Observed frame distributions; no equilibrium, state, or ligand-occupancy assignment",
+            "plotting": plotting,
+            "setups": {s.name: {"pdb": str(s.pdb), "selection": s.selection,
+                                "trajectories": [str(p) for p in s.xtcs]} for s in setups},
+        }
+        write_json(manifest, manifest_path)
+        log(f"Finished {len(setups)} setups / {len(summary_rows)} trajectories. Results: {output}")
+        return 0
+    except (OSError, ValueError, RuntimeError) as error:
+        log(f"ERROR: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
