@@ -1,0 +1,45 @@
+#!/bin/bash -l
+#SBATCH --job-name=or51_strip_solvent
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm_logs/%x-%j.out
+#SBATCH --error=slurm_logs/%x-%j.err
+
+# Put both scripts in ~/OR51_gate. Submit from there:
+#   mkdir -p slurm_logs
+#   sbatch strip_water.slurm
+# The log directory must exist BEFORE sbatch starts the job.
+# Optional: sbatch strip_water.slurm --dry-run
+# To replace previous outputs: sbatch strip_water.slurm --overwrite
+
+set -eo pipefail
+
+module load python/3.13
+source "$HOME/venvs/or_gate/bin/activate"
+set -u
+
+PROJECT_DIR="${OR51_GATE_DIR:-$HOME/OR51_gate}"
+cd "$PROJECT_DIR"
+
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+echo "Job: ${SLURM_JOB_ID:-local} | Host: $(hostname)"
+echo "Project: $PROJECT_DIR"
+python --version
+date
+
+python -u "$PROJECT_DIR/strip_water.py" \
+    --input-root "$PROJECT_DIR/Shared_Trajs" \
+    --output-root "$PROJECT_DIR/Stripped_Trajs" \
+    --chunk 100 \
+    "$@"
+
+date
+echo "Water and ion stripping finished."

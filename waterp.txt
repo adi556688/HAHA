@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+
+"""
+Run from OR51_gate: python strip_water.py [--dry-run] [--overwrite]
+Requires MDTraj and NumPy. Tested with MDTraj 1.11.2.
+
+All stored frames, timestamps, step numbers, and box vectors are retained.
+Coordinates are not aligned, centered, unwrapped, or subsampled. XTC output
+uses MDTraj's standard XTC precision (approximately 0.001 nm).
+Original PDB atom records are retained verbatim, preserving residue numbering,
+chain IDs, atom names, and four-character lipid residue names such as POPC.
+Protein, ligands, and membrane lipids are retained. Output filenames retain
+the _nowater suffix for compatibility, but now exclude water AND ions.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+
+import mdtraj as md
+from mdtraj.formats import XTCTrajectoryFile
+import numpy as np
+
+
+# Supplements MDTraj's residue.is_water recognition; entire residues are removed.
+WATER_NAMES = {
+    "HOH", "WAT", "SOL", "H2O", "OH2", "TIP", "TIP3", "TIP3P",
+    "TIP4", "TIP4P", "TIP5", "TIP5P", "SPC", "SPCE", "T3P", "T4P", "T5P",
+}
+# Match free, single-atom ion residues, never an atom inside a larger molecule.
+ION_ELEMENTS = {
+    "LI", "NA", "K", "RB", "CS", "MG", "CA", "SR", "BA",
+    "ZN", "CD", "CU", "FE", "MN", "CO", "NI", "AL", "F", "CL", "BR", "I",
+}
+ION_NAMES = ION_ELEMENTS | {"SOD", "POT", "CLA", "CAL", "CES", "RUB", "LIT", "IOD"}
+ATOM_RECORDS = {"ATOM", "HETATM"}
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def atom_identity(atom) -> tuple:
+    residue = atom.residue
+    return (atom.name, residue.name, residue.resSeq, residue.chain.chain_id,
+            residue.segment_id)
+
+
+def is_ion(residue, additional_names: set[str]) -> bool:
+    if residue.name.upper() in additional_names:
+        return True
+    if residue.is_protein or residue.n_atoms != 1:
+        return False
+    atom = next(residue.atoms)
+    symbol = atom.element.symbol.upper() if atom.element is not None else ""
+    # Handle names such as Na+, Cl-, NA1+, and MG2+ as well as SOD/POT/CLA.
+    residue_name = residue.name.upper().rstrip("0123456789+-")
+    atom_name = atom.name.upper().rstrip("0123456789+-")
+    return (symbol in ION_ELEMENTS or residue_name in ION_NAMES
+            or atom_name in ION_NAMES)
+
+
+def filtered_pdb(lines: list[str], keep: np.ndarray, n_atoms: int) -> str:
+    """Filter coordinate records without the name changes of a PDB writer."""
+    atom_lines = [line for line in lines if line[:6].strip() in ATOM_RECORDS]
+    if len(atom_lines) != n_atoms:
+        raise ValueError(
+            f"PDB has {len(atom_lines)} atom records but MDTraj loaded {n_atoms}. "
+            "Alternate locations or duplicate atom records need resolving first."
+        )
+    mask = np.zeros(n_atoms, dtype=bool)
+    mask[keep] = True
+    serials = {atom_lines[i][6:11] for i in keep}
+    result = []
+    atom_index = -1
+    kept_since_ter = False
+    last_atom_kept = False
+    for line in lines:
+        record = line[:6].strip()
+        if record in ATOM_RECORDS:
+            atom_index += 1
+            last_atom_kept = bool(mask[atom_index])
+            if last_atom_kept:
+                result.append(line)
+                kept_since_ter = True
+        elif record == "TER":
+            if kept_since_ter:
+                result.append(line if last_atom_kept else "TER\n")
+            kept_since_ter = False
+            last_atom_kept = False
+        elif record in {"ANISOU", "SIGATM", "SIGUIJ"}:
+            if last_atom_kept:
+                result.append(line)
+        elif record == "CONECT":
+            # Retain only connections between remaining original serials.
+            fields = [line[i:i + 5] for i in range(6, len(line.rstrip()), 5)]
+            if fields and fields[0] in serials:
+                neighbors = [value for value in fields[1:] if value in serials]
+                if neighbors:
+                    result.append("CONECT" + fields[0] + "".join(neighbors) + "\n")
+        elif record != "MASTER":  # MASTER contains now-obsolete record counts.
+            result.append(line)
+    if not any(line[:6].strip() == "END" for line in result):
+        result.append("END\n")
+    return "".join(result)
+
+
+@dataclass
+class SystemPlan:
+    name: str
+    pdb: Path
+    xtcs: list[Path]
+    outdir: Path
+    reference: md.Trajectory
+    keep: np.ndarray
+    pdb_text: str
+    water_counts: dict
+    ion_counts: dict
+    water_atoms: int
+    ion_atoms: int
+
+    @property
+    def output_pdb(self) -> Path:
+        return self.outdir / f"{self.pdb.stem}_nowater.pdb"
+
+    def output_xtc(self, xtc: Path) -> Path:
+        return self.outdir / f"{xtc.stem}_nowater.xtc"
+
+    def outputs(self) -> list[Path]:
+        return [self.output_pdb, self.outdir / "kept_atom_indices.npy",
+                self.outdir / "strip_summary.json",
+                *(self.output_xtc(xtc) for xtc in self.xtcs)]
+
+
+def make_plans(args) -> list[SystemPlan]:
+    source = args.input_root.expanduser().resolve()
+    destination = args.output_root.expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"Input directory does not exist: {source}")
+    if (source == destination or source in destination.parents
+            or destination in source.parents):
+        raise ValueError("Input and output roots must be separate, non-nested folders.")
+    water_names = WATER_NAMES | {name.upper() for name in args.water_resname}
+    extra_ion_names = {name.upper() for name in args.ion_resname}
+    plans = []
+    for folder in sorted(path for path in source.iterdir() if path.is_dir()):
+        xtcs = sorted(folder.glob("*.xtc"))
+        if not xtcs:
+            log(f"SKIP {folder.name}: no *.xtc files")
+            continue
+        pdb = folder / "step5_input.pdb"
+        if not pdb.is_file():
+            raise ValueError(f"Missing topology for {folder.name}: {pdb}")
+        lines = pdb.read_text().splitlines(keepends=True)
+        if sum(line[:6].strip() == "MODEL" for line in lines) > 1:
+            raise ValueError(f"Expected a single-model topology PDB: {pdb}")
+        reference = md.load_pdb(str(pdb), standard_names=False, no_boxchk=True)
+        water_residues = [residue for residue in reference.topology.residues
+                          if residue.is_water or residue.name.upper() in water_names]
+        water_ids = {residue.index for residue in water_residues}
+        ion_residues = [residue for residue in reference.topology.residues
+                        if residue.index not in water_ids
+                        and is_ion(residue, extra_ion_names)]
+        removed_ids = water_ids | {residue.index for residue in ion_residues}
+        keep = np.array([atom.index for atom in reference.topology.atoms
+                         if atom.residue.index not in removed_ids], dtype=np.int32)
+        if not water_residues and not ion_residues:
+            names = sorted({r.name for r in reference.topology.residues})
+            raise ValueError(
+                f"No water or ions recognized in {pdb}. Residue names: {', '.join(names)}. "
+                "For unusual names, add --water-resname NAME or --ion-resname NAME."
+            )
+        if not len(keep):
+            raise ValueError(f"No atoms remain after removing water and ions from {pdb}.")
+        plan = SystemPlan(folder.name, pdb, xtcs, destination / folder.name,
+                          reference, keep, filtered_pdb(lines, keep, reference.n_atoms),
+                          dict(Counter(residue.name for residue in water_residues)),
+                          dict(Counter(residue.name for residue in ion_residues)),
+                          sum(residue.n_atoms for residue in water_residues),
+                          sum(residue.n_atoms for residue in ion_residues))
+        if not args.overwrite and not args.dry_run:
+            existing = [str(path) for path in plan.outputs() if path.exists()]
+            if existing:
+                raise ValueError("Output already exists; use --overwrite to replace it: "
+                                 + existing[0])
+        # Check every trajectory before writing any output. XTC lacks atom names:
+        # its atom order must already match this system's step5_input.pdb.
+        for xtc in xtcs:
+            with XTCTrajectoryFile(str(xtc), mode="r") as handle:
+                xyz, _, _, _ = handle.read(n_frames=1)
+            if len(xyz) == 0:
+                raise ValueError(f"Empty trajectory: {xtc}")
+            if xyz.shape[1] != reference.n_atoms:
+                raise ValueError(f"Atom-count mismatch: {xtc} has {xyz.shape[1]} atoms; "
+                                 f"{pdb.name} has {reference.n_atoms}.")
+        log(f"{plan.name}: {reference.n_atoms:,} atoms -> {len(keep):,}; "
+            f"remove {plan.water_atoms:,} water atoms "
+            f"in {len(water_residues):,} residues {plan.water_counts}; "
+            f"remove {plan.ion_atoms:,} ion atoms "
+            f"in {len(ion_residues):,} residues {plan.ion_counts}; "
+            f"{len(xtcs)} XTC files")
+        plans.append(plan)
+    if not plans:
+        raise ValueError(f"No system subfolders containing *.xtc files found under {source}")
+    return plans
+
+
+def temporary_path(destination: Path) -> Path:
+    fd, name = tempfile.mkstemp(prefix=f".{destination.stem}.",
+                                suffix=destination.suffix, dir=destination.parent)
+    os.close(fd)
+    return Path(name)
+
+
+def strip_xtc(source: Path, destination: Path, plan: SystemPlan, chunk: int) -> dict:
+    temporary = temporary_path(destination)
+    n_frames = 0
+    first_time = first_step = last_time = last_step = None
+    started = time.monotonic()
+    try:
+        with XTCTrajectoryFile(str(source), mode="r") as reader, \
+                XTCTrajectoryFile(str(temporary), mode="w") as writer:
+            while True:
+                xyz, times, steps, boxes = reader.read(n_frames=chunk)
+                if len(xyz) == 0:
+                    break
+                if xyz.shape[1] != plan.reference.n_atoms:
+                    raise ValueError(f"Atom-count mismatch while reading {source}")
+                writer.write(np.ascontiguousarray(xyz[:, plan.keep, :]),
+                             time=times, step=steps, box=boxes)
+                if n_frames == 0:
+                    first_time, first_step = float(times[0]), int(steps[0])
+                last_time, last_step = float(times[-1]), int(steps[-1])
+                n_frames += len(xyz)
+                if n_frames % (chunk * 10) == 0:
+                    log(f"  {source.name}: {n_frames:,} frames written")
+        if n_frames == 0:
+            raise ValueError(f"No frames read from {source}")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    log(f"  {source.name} -> {destination.name}: {n_frames:,} frames "
+        f"({time.monotonic() - started:.1f} s)")
+    return {"input": str(source), "output": str(destination), "frames": n_frames,
+            "first_stored_time_ps": first_time, "last_stored_time_ps": last_time,
+            "first_stored_step": first_step, "last_stored_step": last_step}
+
+
+def run_system(plan: SystemPlan, chunk: int) -> None:
+    plan.outdir.mkdir(parents=True, exist_ok=True)
+    # A summary is a completion marker; remove an old one before an overwrite run.
+    summary_path = plan.outdir / "strip_summary.json"
+    summary_path.unlink(missing_ok=True)
+    temporary = temporary_path(plan.output_pdb)
+    try:
+        temporary.write_text(plan.pdb_text)
+        check = md.load_pdb(str(temporary), standard_names=False, no_boxchk=True)
+        expected = [atom_identity(plan.reference.topology.atom(int(i))) for i in plan.keep]
+        observed = [atom_identity(atom) for atom in check.topology.atoms]
+        if observed != expected:
+            raise ValueError(f"Stripped PDB atom identities/order changed for {plan.name}")
+        if not np.allclose(check.xyz, plan.reference.xyz[:, plan.keep, :],
+                           rtol=0, atol=1e-6):
+            raise ValueError(f"Stripped PDB coordinates changed for {plan.name}")
+        os.replace(temporary, plan.output_pdb)
+    finally:
+        temporary.unlink(missing_ok=True)
+    mapping_path = plan.outdir / "kept_atom_indices.npy"
+    temporary = temporary_path(mapping_path)
+    try:
+        np.save(str(temporary), plan.keep)
+        os.replace(temporary, mapping_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    records = [strip_xtc(xtc, plan.output_xtc(xtc), plan, chunk) for xtc in plan.xtcs]
+    summary = {
+        "system": plan.name, "mdtraj_version": md.__version__,
+        "input_pdb": str(plan.pdb), "output_pdb": str(plan.output_pdb),
+        "input_atoms": plan.reference.n_atoms, "output_atoms": len(plan.keep),
+        "removed_water_atoms": plan.water_atoms,
+        "removed_water_residues_by_name": plan.water_counts,
+        "removed_ion_atoms": plan.ion_atoms,
+        "removed_ion_residues_by_name": plan.ion_counts,
+        "removed_total_atoms": plan.reference.n_atoms - len(plan.keep),
+        "selection": "Remove water and common single-atom ions, plus explicitly named ion residues",
+        "atom_mapping": "kept_atom_indices.npy: output index -> original zero-based index",
+        "coordinates": "No fitting, centering, unwrapping, or subsampling; XTC precision ~0.001 nm",
+        "time": "Stored time/step values preserved as supplied; physical sampling interval not inferred",
+        "trajectories": records,
+    }
+    temporary = temporary_path(summary_path)
+    try:
+        temporary.write_text(json.dumps(summary, indent=2) + "\n")
+        os.replace(temporary, summary_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-root", type=Path, default=Path("Shared_Trajs"))
+    parser.add_argument("--output-root", type=Path, default=Path("Stripped_Trajs"))
+    parser.add_argument("--chunk", type=int, default=100, help="Frames per read (default: 100)")
+    parser.add_argument("--dry-run", action="store_true", help="Check inputs; write nothing")
+    parser.add_argument("--overwrite", action="store_true", help="Replace existing outputs")
+    parser.add_argument("--water-resname", action="append", default=[], metavar="NAME",
+                        help="Additional water residue name; repeat for multiple names")
+    parser.add_argument("--ion-resname", action="append", default=[], metavar="NAME",
+                        help="Additional ion residue to remove in full; repeat for multiple names")
+    args = parser.parse_args()
+    if args.chunk < 1:
+        parser.error("--chunk must be at least 1")
+    try:
+        log(f"Python {sys.version.split()[0]}; MDTraj {md.__version__}")
+        plans = make_plans(args)
+        if args.dry_run:
+            log("Dry run passed: each PDB and the first frame of every XTC checked; no files written.")
+            return 0
+        for plan in plans:
+            log(f"Processing {plan.name} -> {plan.outdir}")
+            run_system(plan, args.chunk)
+        log(f"Completed {len(plans)} systems, {sum(len(p.xtcs) for p in plans)} trajectories.")
+        return 0
+    except (OSError, ValueError, RuntimeError) as error:
+        log(f"ERROR: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
