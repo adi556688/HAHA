@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""OR51E2: R262-G198 distance, R262-odorant distance, and pocket RMSD.
+
+Run from ~/OR51_gate with the supplied OR51E2_8F76_reference.pdb beside this
+script. Defaults read all 15 stripped XTCs and their matching PDB topologies.
+All saved frames are retained. --combine-runs concatenates per-run CSV rows.
+No Q181-R262 distance is calculated. No weighting or state assignments are used.
+See README_gate_3d.txt for exact atom selections, reference, and interpretation.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from dataclasses import dataclass
+import hashlib
+import html
+from itertools import product
+import json
+from pathlib import Path
+import re
+import shutil
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import mdtraj as md
+from mdtraj.formats import XTCTrajectoryFile
+import numpy as np
+import pandas as pd
+
+SETUPS = ("OR51E2_C3", "OR51E2_C3_vs_C7", "OR51E2_C7")
+SPECIES = {"OR51E2_C3": ("C3",), "OR51E2_C3_vs_C7": ("C3", "C7"),
+           "OR51E2_C7": ("C7",)}
+POCKET = {104: "HIS", 155: "PHE", 158: "LEU", 180: "HIS", 181: "GLN",
+          198: "GLY", 202: "ILE", 258: "SER", 262: "ARG"}
+TM_RANGES = ((23, 50), (57, 86), (93, 126), (137, 164),
+             (191, 226), (230, 264), (269, 294))
+FIT_RESIDUES = tuple(n for start, end in TM_RANGES for n in range(start, end + 1)
+                     if n not in POCKET)
+R_SIDE = ("CB", "CG", "CD", "NE", "CZ", "NH1", "NH2")
+G_BACKBONE = ("N", "CA", "C", "O")
+SYMMETRY = {155: (("CD1", "CD2"), ("CE1", "CE2")),
+            158: (("CD1", "CD2"),), 262: (("NH1", "NH2"),)}
+X = "d_R262_G198_A"
+Z = "pocket_rmsd_A"
+XLABEL = "R262–G198 minimum distance (Å)"
+ZLABEL = "Pocket heavy-atom RMSD (Å)"
+COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00")
+PLOTLY_URL = "https://cdn.plot.ly/plotly-3.1.0.min.js"
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def natural_key(path):
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", path.name)]
+
+
+def residue_map(topology, chain_id=None):
+    candidates = []
+    for chain in topology.chains:
+        if chain_id is not None and chain.chain_id != chain_id:
+            continue
+        mapping = {}
+        for residue in chain.residues:
+            if residue.is_protein:
+                mapping.setdefault(residue.resSeq, []).append(residue)
+        if all(len(mapping.get(n, [])) == 1 and mapping[n][0].name == name
+               for n, name in POCKET.items()):
+            if any(len(items) != 1 for items in mapping.values()):
+                raise ValueError(f"Duplicate protein residue numbers in chain {chain.chain_id!r}")
+            candidates.append((chain, {n: items[0] for n, items in mapping.items()}))
+    if len(candidates) != 1:
+        raise ValueError("Expected one WT OR51E2 chain matching all nine pocket residues "
+                         f"by PDB residue number; found {len(candidates)}. Check --chain-id.")
+    return candidates[0]
+
+
+def atom_named(residue, name):
+    atoms = [a for a in residue.atoms if a.name == name]
+    if len(atoms) != 1:
+        raise ValueError(f"{residue}: expected exactly one atom named {name}")
+    return atoms[0].index
+
+
+def heavy_atoms(residue):
+    atoms = list(residue.atoms)
+    if any(a.element is None for a in atoms):
+        raise ValueError(f"Missing element assignment in {residue}")
+    return [a for a in atoms if a.element.symbol not in ("H", "D")]
+
+
+def load_reference(path):
+    reference = md.load_pdb(str(path))
+    if reference.n_frames != 1:
+        raise ValueError("Reference must contain exactly one structure.")
+    chain, residues = residue_map(reference.topology)
+    indices = sorted(a.index for r in residues.values() for a in heavy_atoms(r))
+    reference = reference.atom_slice(indices)
+    _, residues = residue_map(reference.topology)
+    for n in FIT_RESIDUES:
+        if n not in residues:
+            raise ValueError(f"Reference missing fitting residue {n}")
+        atom_named(residues[n], "CA")
+    return reference, residues
+
+
+def find_ligands(topology, species):
+    """Identify known C3/C7 acids by C/O heavy-atom composition, not guessed names."""
+    found = []
+    for residue in topology.residues:
+        if residue.is_protein or residue.is_water:
+            continue
+        atoms = heavy_atoms(residue)
+        counts = Counter(a.element.symbol for a in atoms)
+        if counts != Counter({"C": int(species[1:]), "O": 2}):
+            continue
+        oxygens = [a for a in atoms if a.element.symbol == "O"]
+        identifier = (f"chain{residue.chain.index}:{residue.chain.chain_id or '_'}:"
+                      f"resindex{residue.index}:{residue.name}{residue.resSeq}")
+        found.append({"id": identifier, "resname": residue.name,
+                      "resSeq": residue.resSeq, "residue_index": residue.index,
+                      "chain_index": residue.chain.index,
+                      "oxygen_names": [a.name for a in oxygens],
+                      "oxygen_indices": [a.index for a in oxygens]})
+    if not found:
+        inventory = Counter(r.name for r in topology.residues if not r.is_protein)
+        raise ValueError(f"No {species} molecules with the expected C/O composition. "
+                         f"Non-protein residue inventory: {dict(inventory)}")
+    return found
+
+
+@dataclass
+class Setup:
+    name: str
+    pdb: Path
+    xtcs: list
+    keep: np.ndarray
+    topology: md.Topology
+    pairs: np.ndarray
+    protein_local: np.ndarray
+    protein_topology: md.Topology
+    fit: np.ndarray
+    ref_fit: np.ndarray
+    pocket: np.ndarray
+    ref_pocket: np.ndarray
+    swaps: list
+    species: tuple
+    ligands: dict
+    details: dict
+
+
+def prepare_setup(args, name, reference, ref_residues):
+    folder = args.input_root / name
+    pdb = folder / "step5_input_nowater.pdb"
+    xtcs = sorted(folder.glob("run*-skip100_nowater.xtc"), key=natural_key)
+    if len(xtcs) != args.expected_runs:
+        raise ValueError(f"{name}: found {len(xtcs)} trajectories; expected {args.expected_runs}")
+    structure = md.load_pdb(str(pdb))
+    chain, residues = residue_map(structure.topology, args.chain_id)
+    protein_global = sorted(a.index for r in residues.values() for a in heavy_atoms(r))
+    protein_topology = structure.topology.subset(protein_global)
+    if len(protein_topology.find_molecules()) != 1:
+        raise ValueError(f"{name}: receptor heavy atoms must form one bonded molecule for PBC reconstruction.")
+    protein_lookup = {index: i for i, index in enumerate(protein_global)}
+    fit, ref_fit = [], []
+    for n in FIT_RESIDUES:
+        if n not in residues or residues[n].name != ref_residues[n].name:
+            raise ValueError(f"{name}: fitting residue {n} absent or does not match the reference")
+        fit.append(protein_lookup[atom_named(residues[n], "CA")])
+        ref_fit.append(atom_named(ref_residues[n], "CA"))
+    pocket, ref_pocket, pocket_keys = [], [], []
+    for n in POCKET:
+        names = [a.name for a in heavy_atoms(ref_residues[n])]
+        if sorted(names) != sorted(a.name for a in heavy_atoms(residues[n])):
+            raise ValueError(f"{name}: heavy atoms of pocket residue {n} do not match the reference")
+        for atom_name in names:
+            pocket_keys.append((n, atom_name))
+            pocket.append(protein_lookup[atom_named(residues[n], atom_name)])
+            ref_pocket.append(atom_named(ref_residues[n], atom_name))
+    key_lookup = {key: i for i, key in enumerate(pocket_keys)}
+    swaps = []
+    for n, pairs in SYMMETRY.items():
+        left = [key_lookup[(n, atom_name)] for pair in pairs for atom_name in pair]
+        right = [key_lookup[(n, atom_name)] for a, b in pairs for atom_name in (b, a)]
+        swaps.append((np.array(left), np.array(right)))
+    species = SPECIES[name]
+    ligands = {s: find_ligands(structure.topology, s) for s in species}
+    r_side = [atom_named(residues[262], n) for n in R_SIDE]
+    r_head = [atom_named(residues[262], n) for n in ("NH1", "NH2")]
+    g_backbone = [atom_named(residues[198], n) for n in G_BACKBONE]
+    pairs = list(product(r_side, g_backbone))
+    for s in species:
+        for ligand in ligands[s]:
+            pairs.extend(product(r_head, ligand["oxygen_indices"]))
+    keep = np.array(sorted(set(protein_global) | {b for _, b in pairs}), dtype=np.int32)
+    lookup = {index: i for i, index in enumerate(keep)}
+    local_pairs = np.array([(lookup[a], lookup[b]) for a, b in pairs], dtype=np.int32)
+    for xtc in xtcs:
+        with XTCTrajectoryFile(str(xtc), "r") as reader:
+            xyz, times, steps, boxes = reader.read(n_frames=1)
+        if len(xyz) != 1 or xyz.shape[1] != structure.n_atoms:
+            raise ValueError(f"{xtc}: empty file or atom count does not match {pdb}")
+        validate_box(boxes, len(xyz), xtc)
+    details = {"topology": str(pdb), "trajectories": [str(p) for p in xtcs],
+               "receptor_chain_id": chain.chain_id, "receptor_chain_index": chain.index,
+               "total_input_atoms": structure.n_atoms, "ligands": ligands,
+               "fit_resSeq": list(FIT_RESIDUES), "pocket_atom_keys": pocket_keys,
+               "pocket_input_atom_indices": [protein_global[i] for i in pocket],
+               "R262_G198_atom_pairs": pairs[:28]}
+    log(f"{name}: {len(xtcs)} XTCs; chain {chain.chain_id!r}; "
+        f"{len(fit)} fit Cα atoms; {len(pocket)} pocket heavy atoms; "
+        + ", ".join(f"{s}: {len(ligands[s])} molecules" for s in species))
+    return Setup(name, pdb, xtcs, keep, structure.topology.subset(keep), local_pairs,
+                 np.array([lookup[i] for i in protein_global]), protein_topology,
+                 np.array(fit), np.array(ref_fit), np.array(pocket), np.array(ref_pocket),
+                 swaps, species, ligands, details)
+
+
+def validate_box(boxes, n_frames, path):
+    if (boxes is None or boxes.shape != (n_frames, 3, 3)
+            or not np.isfinite(boxes).all()
+            or np.any(np.linalg.det(boxes.astype(float)) <= 1e-9)):
+        raise ValueError(f"{path}: missing or invalid periodic unit cells")
+
+
+def pocket_rmsd(aligned, reference_xyz, swaps):
+    """RMSD after the external helix fit; no second fit on the pocket.
+
+    Minimize over equivalent Phe ring, Leu methyl, and Arg terminal-N labels.
+    This prevents chemically identical label swaps from inflating RMSD.
+    """
+    squared = np.sum((aligned.astype(float) - reference_xyz) ** 2, axis=(1, 2))
+    for left, right in swaps:
+        original = np.sum((aligned[:, left] - reference_xyz[left]) ** 2, axis=(1, 2))
+        swapped = np.sum((aligned[:, right] - reference_xyz[left]) ** 2, axis=(1, 2))
+        squared += np.minimum(original, swapped) - original
+    return np.sqrt(np.maximum(squared, 0) / aligned.shape[1]) * 10.0
+
+
+def extract_run(setup, xtc, reference, chunk_size):
+    tables, offset = [], 0
+    bonds = np.array([(a.index, b.index) for a, b in setup.protein_topology.bonds])
+    with XTCTrajectoryFile(str(xtc), "r") as reader:
+        while True:
+            xyz, times, steps, boxes = reader.read(n_frames=chunk_size, atom_indices=setup.keep)
+            if not len(xyz):
+                break
+            if not np.isfinite(xyz).all() or not np.isfinite(times).all():
+                raise ValueError(f"{xtc}: non-finite coordinates or timestamps near frame {offset}")
+            validate_box(boxes, len(xyz), xtc)
+            traj = md.Trajectory(xyz, setup.topology)
+            traj.unitcell_vectors = boxes
+            distances = md.compute_distances(traj, setup.pairs, periodic=True) * 10.0
+            data = {"setup": setup.name, "trajectory": xtc.name,
+                    "frame": np.arange(offset, offset + len(xyz)),
+                    "stored_time_ps": times, "stored_step": steps,
+                    X: distances[:, :28].min(axis=1)}
+            start = 28
+            for species in setup.species:
+                n_ligands = len(setup.ligands[species])
+                values = distances[:, start:start + 4 * n_ligands]
+                per_ligand = values.reshape(len(xyz), n_ligands, 4).min(axis=2)
+                nearest = per_ligand.argmin(axis=1)
+                data[f"d_R262_{species}_A"] = per_ligand[np.arange(len(xyz)), nearest]
+                identifiers = np.array([x["id"] for x in setup.ligands[species]], dtype=object)
+                data[f"nearest_{species}_id"] = identifiers[nearest]
+                start += 4 * n_ligands
+            # Distances were measured in the original periodic coordinates.
+            # Unwrap the whole receptor before fitting; never fit a broken protein.
+            protein = traj.atom_slice(setup.protein_local)
+            protein.make_molecules_whole(inplace=True)
+            bond_lengths = md.compute_distances(protein, bonds, periodic=False)
+            if np.any(bond_lengths > 0.30):
+                raise ValueError(f"{xtc}: receptor remains broken (bond >3 Å) near frame {offset}")
+            protein.superpose(reference, atom_indices=setup.fit,
+                              ref_atom_indices=setup.ref_fit, parallel=False)
+            data[Z] = pocket_rmsd(protein.xyz[:, setup.pocket],
+                                  reference.xyz[0, setup.ref_pocket], setup.swaps)
+            tables.append(pd.DataFrame(data))
+            offset += len(xyz)
+    if not tables:
+        raise ValueError(f"No frames in {xtc}")
+    table = pd.concat(tables, ignore_index=True)
+    log(f"  {xtc.name}: {len(table):,} frames; R–G {table[X].min():.2f}–{table[X].max():.2f} Å; "
+        f"pocket RMSD {table[Z].min():.2f}–{table[Z].max():.2f} Å")
+    return table
+
+
+def column_for(species):
+    return f"d_R262_{species}_A"
+
+
+def limits_from(results):
+    xs, ys, zs = [], [], []
+    for name, runs in results.items():
+        for table in runs:
+            xs.extend(table[X])
+            zs.extend(table[Z])
+            for species in SPECIES[name]:
+                ys.extend(table[column_for(species)])
+    return [(0, max(1.0, float(max(values)) * 1.06)) for values in (xs, ys, zs)]
+
+
+def traces_for(runs, species):
+    traces = []
+    for i, table in enumerate(runs):
+        custom = [[str(row.trajectory), int(row.frame), str(getattr(row, f"nearest_{species}_id"))]
+                  for row in table.itertuples(index=False)]
+        traces.append({"type": "scatter3d", "mode": "markers",
+                       "name": str(table["trajectory"].iloc[0]),
+                       "x": table[X].tolist(), "y": table[column_for(species)].tolist(),
+                       "z": table[Z].tolist(), "customdata": custom,
+                       "marker": {"size": 3, "opacity": 0.65, "color": COLORS[i % len(COLORS)]},
+                       "hovertemplate": "Run: %{customdata[0]}<br>Frame (0-based): %{customdata[1]}"
+                       "<br>Nearest ligand: %{customdata[2]}<br>R–G: %{x:.3f} Å"
+                       "<br>R–ligand: %{y:.3f} Å<br>Pocket RMSD: %{z:.3f} Å<extra></extra>"})
+    return traces
+
+
+def plot_group(name, runs, stem, limits, dpi):
+    species_list = SPECIES[name]
+    n_frames = sum(len(t) for t in runs)
+    title = f"{name} · {len(runs)} run(s), {n_frames:,} saved frames"
+    figure = plt.figure(figsize=(8 * len(species_list), 7), layout="constrained")
+    projections, axes = plt.subplots(len(species_list), 3,
+                                    figsize=(16, 4.6 * len(species_list)),
+                                    squeeze=False, layout="constrained")
+    html_plots = []
+    for j, species in enumerate(species_list):
+        ax = figure.add_subplot(1, len(species_list), j + 1, projection="3d")
+        ylabel = f"R262–{species} head-group minimum distance (Å)"
+        for i, table in enumerate(runs):
+            values = (table[X].to_numpy(), table[column_for(species)].to_numpy(),
+                      table[Z].to_numpy())
+            label = str(table["trajectory"].iloc[0]).replace("-skip100_nowater.xtc", "")
+            color = COLORS[i % len(COLORS)]
+            ax.scatter(*values, s=6, alpha=0.45, color=color, label=label, depthshade=False)
+            for axis, (a, b) in zip(axes[j], ((0, 1), (0, 2), (1, 2))):
+                axis.scatter(values[a], values[b], s=4, alpha=0.4, color=color,
+                             label=label, rasterized=True)
+        ax.set(xlabel=XLABEL, ylabel=ylabel, zlabel=ZLABEL,
+               xlim=limits[0], ylim=limits[1], zlim=limits[2], title=species)
+        ax.view_init(elev=24, azim=-58)
+        ax.legend(fontsize=8, loc="upper right")
+        labels = (XLABEL, ylabel, ZLABEL)
+        for axis, (a, b) in zip(axes[j], ((0, 1), (0, 2), (1, 2))):
+            axis.set(xlabel=labels[a], ylabel=labels[b], xlim=limits[a], ylim=limits[b])
+            axis.grid(alpha=0.15)
+        axes[j, 0].set_title(species)
+        axes[j, 0].legend(fontsize=8)
+        html_plots.append({"id": f"plot{j}", "traces": traces_for(runs, species),
+                           "layout": {"title": {"text": species}, "height": 650,
+                                      "margin": {"l": 0, "r": 0, "b": 0, "t": 45},
+                                      "scene": {"xaxis": {"title": {"text": XLABEL}, "range": limits[0]},
+                                                "yaxis": {"title": {"text": ylabel}, "range": limits[1]},
+                                                "zaxis": {"title": {"text": ZLABEL}, "range": limits[2]}}}})
+    figure.suptitle(title)
+    projections.suptitle(title + " · pairwise projections")
+    for extension in ("png", "pdf"):
+        figure.savefig(f"{stem}_3d.{extension}", dpi=dpi)
+        projections.savefig(f"{stem}_projections.{extension}", dpi=dpi)
+    plt.close(figure)
+    plt.close(projections)
+    # No Python Plotly dependency. Opening the HTML uses the Plotly CDN.
+    payload = json.dumps(html_plots, ensure_ascii=True).replace("<", "\\u003c")
+    divs = "".join(f'<div id="plot{j}" class="plot"></div>' for j in range(len(species_list)))
+    document = ("<!doctype html><html><head><meta charset='utf-8'><title>OR51E2 3D coordinates</title>"
+                "<style>body{font:16px system-ui;margin:24px;color:#172a3a}.plots{display:flex;flex-wrap:wrap}"
+                ".plot{min-width:560px;flex:1}h1{font-size:24px}p{max-width:1100px}</style></head><body>"
+                f"<h1>{html.escape(title)}</h1><p>Drag to rotate; hover to identify an original frame. "
+                "Click a run in the legend to hide/show it. Every saved frame is plotted. "
+                "C3 and C7 minima are calculated separately; the nearest molecule can change. "
+                "These coordinates do not assign binding or activation states.</p>"
+                "<p id='status'>Loading the plotting library (requires internet access). "
+                "Offline: open the PNG/PDF plots.</p>"
+                f"<div class='plots'>{divs}</div><script src='{PLOTLY_URL}'></script><script>"
+                f"const plots={payload};if(typeof Plotly!=='undefined'){{"
+                "document.getElementById('status').textContent='';"
+                "for(const p of plots){Plotly.newPlot(p.id,p.traces,p.layout,{responsive:true,displaylogo:false});}"
+                "}</script></body></html>")
+    Path(f"{stem}_3d.html").write_text(document, encoding="utf-8")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-root", type=Path, default=Path("Stripped_Trajs"))
+    parser.add_argument("--output-root", type=Path, default=Path("Gate_3D"))
+    parser.add_argument("--reference", type=Path,
+                        default=Path(__file__).resolve().with_name("OR51E2_8F76_reference.pdb"))
+    parser.add_argument("--setups", nargs="+", choices=SETUPS, default=list(SETUPS))
+    parser.add_argument("--expected-runs", type=int, default=5)
+    parser.add_argument("--chunk", type=int, default=100)
+    parser.add_argument("--chain-id", help="PDB chain ID of receptor; automatic if unique")
+    parser.add_argument("--combine-runs", action="store_true", help="Add concatenated CSVs and plots")
+    parser.add_argument("--plot-only", action="store_true", help="Replot this script's completed CSV output")
+    parser.add_argument("--dry-run", action="store_true", help="Validate topologies, reference, and first XTC frames")
+    parser.add_argument("--overwrite", action="store_true", help="Replace this analysis's existing outputs")
+    parser.add_argument("--dpi", type=int, default=180)
+    args = parser.parse_args()
+    if min(args.chunk, args.expected_runs, args.dpi) < 1:
+        parser.error("--chunk, --expected-runs, and --dpi must be positive")
+    if len(set(args.setups)) != len(args.setups):
+        parser.error("Duplicate setup names")
+    if args.plot_only and args.dry_run:
+        parser.error("--plot-only and --dry-run cannot be combined")
+    args.input_root = args.input_root.expanduser().resolve()
+    args.output_root = args.output_root.expanduser().resolve()
+    args.reference = args.reference.expanduser().resolve()
+    if (args.output_root == args.input_root or args.input_root in args.output_root.parents
+            or args.output_root in args.input_root.parents):
+        parser.error("Input and output roots must be separate, non-nested directories")
+    return args
+
+
+def read_existing(args):
+    manifest = json.loads((args.output_root / "manifest.json").read_text())
+    if manifest.get("schema") != "or51_gate_3d_v1" or not manifest.get("completed"):
+        raise ValueError("--plot-only requires a completed gate_3d.py analysis")
+    results = {}
+    for name in args.setups:
+        if name not in manifest["setups"]:
+            raise ValueError(f"{name} is absent from the saved analysis")
+        xtcs = manifest["setups"][name]["trajectories"]
+        if len(xtcs) != args.expected_runs:
+            raise ValueError(f"{name}: run count differs from --expected-runs")
+        runs = []
+        for xtc in xtcs:
+            path = args.output_root / name / f"{Path(xtc).stem}_coordinates.csv"
+            table = pd.read_csv(path)
+            numeric = [X, Z] + [column_for(s) for s in SPECIES[name]]
+            required = numeric + ["setup", "trajectory", "frame", "stored_time_ps", "stored_step"]
+            required += [f"nearest_{s}_id" for s in SPECIES[name]]
+            if table.empty or not set(required) <= set(table.columns):
+                raise ValueError(f"{path}: missing or empty coordinates")
+            if (not np.isfinite(table[numeric].to_numpy()).all()
+                    or (table[numeric].to_numpy() < 0).any()
+                    or not np.array_equal(table.frame, np.arange(len(table)))
+                    or not table.setup.eq(name).all()
+                    or not table.trajectory.eq(Path(xtc).name).all()):
+                raise ValueError(f"{path}: inconsistent coordinates or frame provenance")
+            runs.append(table)
+        results[name] = runs
+    return results, manifest
+
+
+def main():
+    args = parse_args()
+    if args.plot_only:
+        results, manifest = read_existing(args)
+        args.combine_runs = args.combine_runs or manifest.get("combined", False)
+    else:
+        reference, residues = load_reference(args.reference)
+        setups = [prepare_setup(args, name, reference, residues) for name in args.setups]
+        if args.dry_run:
+            log("Input validation passed. No output files written.")
+            return
+        if args.output_root.exists() and any(args.output_root.iterdir()) and not args.overwrite:
+            raise ValueError("Output folder is not empty; choose a new --output-root or use --overwrite")
+        args.output_root.mkdir(parents=True, exist_ok=True)
+        manifest = {"schema": "or51_gate_3d_v1", "completed": False,
+                    "reference": str(args.reference),
+                    "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
+                    "mdtraj_version": md.__version__, "numpy_version": np.__version__,
+                    "distance_PBC": "minimum image", "frame_index": "zero-based in each input XTC",
+                    "pocket_rmsd": "All heavy atoms, common supplied reference, TM CA fit excluding pocket; "
+                    "no pocket refit; symmetry correction for PHE155, LEU158, ARG262",
+                    "R262_G198": "min(R262 CB CG CD NE CZ NH1 NH2, G198 N CA C O)",
+                    "R262_ligand": "min(R262 NH1 NH2, ligand O atoms); nearest molecule per species per frame",
+                    "setups": {s.name: s.details for s in setups}, "combined": args.combine_runs}
+        (args.output_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        if args.reference != args.output_root / "reference_used.pdb":
+            shutil.copyfile(args.reference, args.output_root / "reference_used.pdb")
+        results = {}
+        summary = []
+        for setup in setups:
+            destination = args.output_root / setup.name
+            destination.mkdir(exist_ok=True)
+            results[setup.name] = []
+            for xtc in setup.xtcs:
+                table = extract_run(setup, xtc, reference, args.chunk)
+                table.to_csv(destination / f"{xtc.stem}_coordinates.csv", index=False, float_format="%.10g")
+                results[setup.name].append(table)
+                summary.append({"setup": setup.name, "trajectory": xtc.name, "frames": len(table)})
+        pd.DataFrame(summary).to_csv(args.output_root / "summary.csv", index=False)
+    limits = limits_from(results)
+    for name, runs in results.items():
+        destination = args.output_root / name
+        for table in runs:
+            stem = destination / Path(table.trajectory.iloc[0]).stem
+            plot_group(name, [table], stem, limits, args.dpi)
+        if args.combine_runs:
+            combined = pd.concat(runs, ignore_index=True)
+            combined.to_csv(destination / "combined_coordinates.csv", index=False, float_format="%.10g")
+            plot_group(name, runs, destination / "combined", limits, args.dpi)
+    if not args.plot_only:
+        manifest["completed"] = True
+        (args.output_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    log(f"Finished: {args.output_root}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"ERROR: {error}", file=sys.stderr, flush=True)
+        sys.exit(1)

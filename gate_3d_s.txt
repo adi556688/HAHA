@@ -1,0 +1,55 @@
+#!/bin/bash
+#SBATCH --job-name=or51_gate_3d
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm_logs/%x-%j.out
+#SBATCH --error=slurm_logs/%x-%j.err
+
+# Put this script, gate_3d.py, and OR51E2_8F76_reference.pdb in ~/OR51_gate.
+# Submit from that folder after creating slurm_logs:
+#   mkdir -p slurm_logs
+#   sbatch gate_3d.slurm
+# Optional: --dry-run, --plot-only, or --overwrite.
+# Individual plots and combined five-run plots are both produced by default here.
+
+set -euo pipefail
+PROJECT_DIR="${OR51_GATE_DIR:-$HOME/OR51_gate}"
+OR51_VENV_DIR="${OR51_GATE_VENV:-$HOME/venvs/or_gate_py311}"
+OR51_PYTHON="$OR51_VENV_DIR/bin/python"
+cd "$PROJECT_DIR"
+unset PYTHONHOME PYTHONPATH
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+export MPLBACKEND=Agg
+
+echo "Job: ${SLURM_JOB_ID:-local} | Host: $(hostname)"
+echo "Environment: $OR51_VENV_DIR"
+date
+"$OR51_PYTHON" -u - <<'PY'
+import sys
+from pathlib import Path
+if sys.prefix == sys.base_prefix:
+    raise RuntimeError("Expected the working or_gate_py311 virtual environment")
+config = Path(sys.prefix) / "pyvenv.cfg"
+settings = dict(line.split("=", 1) for line in config.read_text().splitlines() if "=" in line)
+version = {k.strip(): v.strip() for k, v in settings.items()}.get("version", "")
+if version and tuple(map(int, version.split(".")[:2])) != sys.version_info[:2]:
+    raise RuntimeError(f"Environment created with Python {version}; this node runs {sys.version.split()[0]}")
+import mdtraj, numpy, pandas, matplotlib
+print("Python", sys.version.split()[0], "| MDTraj", mdtraj.__version__)
+PY
+
+"$OR51_PYTHON" -u "$PROJECT_DIR/gate_3d.py" \
+    --input-root "$PROJECT_DIR/Stripped_Trajs" \
+    --output-root "$PROJECT_DIR/Gate_3D" \
+    --reference "$PROJECT_DIR/OR51E2_8F76_reference.pdb" \
+    --combine-runs \
+    "$@"
+date
+echo "Three-coordinate analysis finished."
