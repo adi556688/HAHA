@@ -1,0 +1,56 @@
+#!/bin/bash
+#SBATCH --job-name=or51_states
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm_logs/%x-%j.out
+#SBATCH --error=slurm_logs/%x-%j.err
+
+# Put extract_or51_states.py and this file in ~/OR51_gate.
+# Before sbatch: cd ~/OR51_gate && mkdir -p slurm_logs
+# Validate: sbatch extract_or51_states.slurm --dry-run
+# Extract:  sbatch extract_or51_states.slurm
+# All eligible frames: sbatch extract_or51_states.slurm --max-pdb-per-category 0
+# Optional arguments are forwarded to the Python script.
+
+set -euo pipefail
+PROJECT_DIR="${OR51_GATE_DIR:-$HOME/OR51_gate}"
+OR51_VENV_DIR="${OR51_GATE_VENV:-$HOME/venvs/or_gate_py311}"
+OR51_PYTHON="$OR51_VENV_DIR/bin/python"
+cd "$PROJECT_DIR"
+unset PYTHONHOME PYTHONPATH
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+echo "Job: ${SLURM_JOB_ID:-local} | Host: $(hostname)"
+echo "Project: $PROJECT_DIR"
+echo "Python: $OR51_PYTHON"
+date
+
+"$OR51_PYTHON" -u - <<'PY'
+import sys
+from pathlib import Path
+
+if sys.prefix == sys.base_prefix:
+    raise RuntimeError("Expected the existing or_gate_py311 virtual environment")
+config = Path(sys.prefix) / "pyvenv.cfg"
+settings = dict(line.split("=", 1) for line in config.read_text().splitlines() if "=" in line)
+version = {k.strip(): v.strip() for k, v in settings.items()}.get("version", "")
+if version and tuple(map(int, version.split(".")[:2])) != sys.version_info[:2]:
+    raise RuntimeError(f"Environment created with Python {version}; node runs {sys.version.split()[0]}")
+import mdtraj, numpy
+print("Python", sys.version.split()[0], "| MDTraj", mdtraj.__version__, "| NumPy", numpy.__version__)
+PY
+
+"$OR51_PYTHON" -u "$PROJECT_DIR/extract_or51_states.py" \
+    --input-root "$PROJECT_DIR/Stripped_Trajs" \
+    --output-root "$PROJECT_DIR/State_Snapshots" \
+    "$@"
+
+date
+echo "Candidate structure extraction finished. Inspect selected_frames.csv and PDBs."

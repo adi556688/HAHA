@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""Extract inspectable OR51E2 ligand-state candidate PDBs, without MSM.
+
+Contacts follow the paper's 12-residue / <4.5 A feature definition. The
+associated/intermediate rules below are adjustable geometric screening choices,
+not the paper's MSM state definitions. See README_extract_or51_states.txt.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import csv
+from datetime import datetime, timezone
+import gzip
+import hashlib
+from itertools import product
+import json
+from pathlib import Path
+import platform
+import random
+import re
+import sys
+import traceback
+
+import mdtraj as md
+from mdtraj.formats import XTCTrajectoryFile
+import numpy as np
+
+VERSION = "1.0.0"
+SETUPS = {
+    "OR51E2_C3": ("C3",),
+    "OR51E2_C7": ("C7",),
+    "OR51E2_C3_vs_C7": ("C3", "C7"),
+}
+PANEL = {262: "ARG", 104: "HIS", 155: "PHE", 202: "ILE", 258: "SER",
+         181: "GLN", 261: "HIS", 201: "ALA", 206: "MET", 272: "ARG",
+         254: "LEU", 108: "ALA"}
+PANEL_NUMBERS = tuple(PANEL)
+POCKET_RESIDUES = (104, 155, 202, 258, 201, 206, 254, 108)
+GATE_RESIDUES = (262, 181, 261, 272)
+ASSOCIATED = "associated_candidate"
+INTERMEDIATE = "intermediate_candidate"
+CANDIDATES = (ASSOCIATED, INTERMEDIATE)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def natural_key(path):
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r"(\d+)", path.name)]
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def dump_json(path, value):
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def heavy_atoms(residue):
+    atoms = list(residue.atoms)
+    if any(atom.element is None for atom in atoms):
+        raise ValueError(f"Cannot identify heavy atoms: element missing in {residue}")
+    return [atom for atom in atoms if atom.element.symbol not in ("H", "D")]
+
+
+def receptor_residues(topology, chain_id=None):
+    candidates = []
+    for chain in topology.chains:
+        if chain_id is not None and chain.chain_id != chain_id:
+            continue
+        mapping = {}
+        for residue in chain.residues:
+            if residue.is_protein:
+                mapping.setdefault(residue.resSeq, []).append(residue)
+        if all(len(mapping.get(n, [])) == 1 and mapping[n][0].name == name
+               for n, name in PANEL.items()):
+            if any(len(residues) != 1 for residues in mapping.values()):
+                raise ValueError(f"Duplicate protein residue numbers in chain {chain.chain_id!r}")
+            candidates.append((chain, {n: values[0] for n, values in mapping.items()}))
+    if len(candidates) != 1:
+        raise ValueError("Expected exactly one receptor chain matching the 12 numbered "
+                         f"WT residues; found {len(candidates)}. Check numbering/--chain-id.")
+    return candidates[0]
+
+
+def detect_ligands(topology):
+    ligands = []
+    for residue in topology.residues:
+        if residue.is_protein or residue.is_water:
+            continue
+        atoms = heavy_atoms(residue)
+        composition = Counter(atom.element.symbol for atom in atoms)
+        species = next((species for species in ("C3", "C7")
+                        if composition == Counter({"C": int(species[1:]), "O": 2})), None)
+        if species is None:
+            continue
+        ligands.append({
+            "id": (f"{species}_chain{residue.chain.index}_resindex{residue.index}_"
+                   f"{residue.name}{residue.resSeq}"),
+            "species": species, "resname": residue.name, "resSeq": residue.resSeq,
+            "residue_index0": residue.index, "chain_index0": residue.chain.index,
+            "chain_id": residue.chain.chain_id,
+            "input_atom_indices0": [atom.index for atom in residue.atoms],
+            "input_heavy_indices0": [atom.index for atom in atoms],
+        })
+    return ligands
+
+
+def validate_box(trajectory, source, no_pbc=False):
+    if not np.isfinite(trajectory.xyz).all() or not np.isfinite(trajectory.time).all():
+        raise ValueError(f"Nonfinite coordinates/time in {source}")
+    if no_pbc:
+        return
+    boxes = trajectory.unitcell_vectors
+    if boxes is None or boxes.shape != (trajectory.n_frames, 3, 3):
+        raise ValueError(f"Missing periodic box in {source}; only use --no-pbc for pre-unwrapped data")
+    if not np.isfinite(boxes).all() or np.any(np.linalg.det(boxes) <= 1e-6):
+        raise ValueError(f"Invalid periodic box in {source}")
+
+
+def prepare_setup(args, name):
+    folder = args.input_root / name
+    pdb = folder / "step5_input_nowater.pdb"
+    xtcs = sorted(folder.glob("run*-skip100_nowater.xtc"), key=natural_key)
+    if not pdb.is_file():
+        raise FileNotFoundError(pdb)
+    if len(xtcs) != args.expected_runs:
+        raise ValueError(f"{name}: found {len(xtcs)} trajectories, expected {args.expected_runs}")
+    structure = md.load_pdb(str(pdb))
+    if structure.n_frames != 1:
+        raise ValueError(f"Topology must have one PDB model: {pdb}")
+    chain, residues = receptor_residues(structure.topology, args.chain_id)
+    ligands = detect_ligands(structure.topology)
+    found = {item["species"] for item in ligands}
+    if found != set(SETUPS[name]):
+        raise ValueError(f"{name}: ligand species found {sorted(found)}, expected {SETUPS[name]}")
+    receptor_global = sorted(atom.index for residue in residues.values() for atom in residue.atoms)
+    keep = np.array(sorted(set(receptor_global).union(
+        *(set(ligand["input_atom_indices0"]) for ligand in ligands))), dtype=np.int32)
+    lookup = {int(index): i for i, index in enumerate(keep)}
+    topology = structure.topology.subset(keep)
+    receptor = np.array([lookup[index] for index in receptor_global], dtype=np.int32)
+    receptor_topology = topology.subset(receptor)
+    if not args.no_pbc and len(receptor_topology.find_molecules()) != 1:
+        raise ValueError(f"{name}: receptor bonds do not define one connected molecule; "
+                         "repair topology/bond records before periodic reconstruction")
+    panel = [np.array([lookup[a.index] for a in heavy_atoms(residues[n])], dtype=np.int32)
+             for n in PANEL_NUMBERS]
+    pairs, slices = [], []
+    for ligand in ligands:
+        ligand["local_atom_indices0"] = [lookup[i] for i in ligand["input_atom_indices0"]]
+        ligand["local_heavy_indices0"] = [lookup[i] for i in ligand["input_heavy_indices0"]]
+        ligand_pairs, boundaries = [], [0]
+        for receptor_atoms in panel:
+            ligand_pairs.extend(product(receptor_atoms, ligand["local_heavy_indices0"]))
+            boundaries.append(len(ligand_pairs))
+        pairs.append(np.array(ligand_pairs, dtype=np.int32))
+        slices.append(list(zip(boundaries[:-1], boundaries[1:])))
+    for xtc in xtcs:
+        with XTCTrajectoryFile(str(xtc), "r") as reader:
+            xyz, times, steps, boxes = reader.read(n_frames=1)
+        if len(xyz) != 1 or xyz.shape[1] != structure.n_atoms:
+            raise ValueError(f"{xtc}: empty or atom count mismatches {pdb}")
+        probe = md.Trajectory(xyz[:, keep], topology, time=times)
+        if boxes is not None:
+            probe.unitcell_vectors = boxes
+        validate_box(probe, xtc, args.no_pbc)
+    result = dict(name=name, pdb=pdb, xtcs=xtcs, full_topology=structure.topology,
+                  topology=topology, keep=keep, receptor=receptor, panel=panel,
+                  ligands=ligands, pairs=pairs, slices=slices, chain_id=chain.chain_id,
+                  chain_index0=chain.index)
+    log(f"{name}: {len(xtcs)} runs, receptor chain {chain.chain_id!r}, "
+        + ", ".join(f"{species}={sum(l['species'] == species for l in ligands)}"
+                    for species in SETUPS[name]))
+    return result
+
+
+def contact_distances(trajectory, setup, periodic=True):
+    """Return [frame, individual ligand, panel residue] minimum heavy distances, A."""
+    result = np.empty((trajectory.n_frames, len(setup["ligands"]), len(PANEL)), dtype=np.float32)
+    for i, pairs in enumerate(setup["pairs"]):
+        distances = md.compute_distances(trajectory, pairs, periodic=periodic)
+        for j, (start, stop) in enumerate(setup["slices"][i]):
+            result[:, i, j] = distances[:, start:stop].min(axis=1) * 10.0
+    return result
+
+
+def classify_distances(distances_A, args):
+    """Heuristic candidate labels; all contacts in a row must belong to one ligand."""
+    contacts = distances_A < args.contact_cutoff
+    total = contacts.sum(axis=-1)
+    pocket = contacts[..., [PANEL_NUMBERS.index(n) for n in POCKET_RESIDUES]].sum(axis=-1)
+    gate = contacts[..., [PANEL_NUMBERS.index(n) for n in GATE_RESIDUES]].sum(axis=-1)
+    associated = ((distances_A[..., PANEL_NUMBERS.index(155)] <= args.deep_cutoff)
+                  & (pocket >= args.min_pocket_contacts))
+    intermediate = (~associated & (total >= args.min_intermediate_contacts) & (gate >= 1))
+    labels = np.full(total.shape, "no_panel_contact", dtype="U24")
+    labels[total > 0] = "ambiguous_contact"
+    labels[intermediate] = INTERMEDIATE
+    labels[associated] = ASSOCIATED
+    return labels, pocket, gate, total
+
+
+def all_categories(species):
+    singles = [f"{s}_{state.removesuffix('_candidate')}" for s in species for state in CANDIDATES]
+    if len(species) == 2:
+        singles += [f"C3_{a.removesuffix('_candidate')}__C7_{b.removesuffix('_candidate')}"
+                    for a, b in product(CANDIDATES, repeat=2)]
+    return singles
+
+
+def frame_categories(labels, ligands):
+    """A frame may contain several qualifying molecules and joint combinations."""
+    groups = {}
+    for i, (state, ligand) in enumerate(zip(labels, ligands)):
+        if state in CANDIDATES:
+            key = f"{ligand['species']}_{state.removesuffix('_candidate')}"
+            groups.setdefault(key, []).append((i,))
+    for i, first in enumerate(ligands):
+        if first["species"] != "C3" or labels[i] not in CANDIDATES:
+            continue
+        for j, second in enumerate(ligands):
+            if second["species"] != "C7" or labels[j] not in CANDIDATES:
+                continue
+            key = (f"C3_{labels[i].removesuffix('_candidate')}__"
+                   f"C7_{labels[j].removesuffix('_candidate')}")
+            groups.setdefault(key, []).append((i, j))
+    return groups
+
+
+class Reservoir:
+    def __init__(self, cap, seed):
+        self.cap, self.rng, self.seen, self.items = cap, random.Random(seed), 0, []
+
+    def add(self, item):
+        self.seen += 1
+        if self.cap == 0 or len(self.items) < self.cap:
+            self.items.append(item)
+        else:
+            index = self.rng.randrange(self.seen)
+            if index < self.cap:
+                self.items[index] = item
+
+
+def reconstruct_snapshot(snapshot, setup, args):
+    """Unwrap receptor and acids, then place each acid by its closest panel contact.
+
+    Relative-anchor MIC is exact for these short acids if the molecule fits
+    within a periodic image; all intra-ligand pair distances are checked.
+    """
+    result = snapshot[:]
+    if args.no_pbc:
+        result.unitcell_vectors = None
+        return result
+    validate_box(snapshot, "snapshot")
+    before = contact_distances(snapshot, setup, periodic=True)[0]
+    protein = snapshot.atom_slice(setup["receptor"])
+    protein.make_molecules_whole(inplace=True)
+    result.xyz[:, setup["receptor"], :] = protein.xyz
+    for ligand, pairs in zip(setup["ligands"], setup["pairs"]):
+        atoms = ligand["local_atom_indices0"]
+        anchor = ligand["local_heavy_indices0"][0]
+        anchor_pairs = np.array([(anchor, index) for index in atoms], dtype=np.int32)
+        displacements = md.compute_displacements(snapshot, anchor_pairs, periodic=True)[0]
+        rebuilt = snapshot.xyz[0, anchor] + displacements
+        # Reject a molecule too large/fragmented for a single relative-anchor image.
+        internal_pairs = np.array([(a, b) for k, a in enumerate(atoms) for b in atoms[k+1:]],
+                                  dtype=np.int32)
+        internal = md.compute_distances(snapshot, internal_pairs, periodic=True)[0]
+        nonperiodic = np.array([np.linalg.norm(rebuilt[k] - rebuilt[j])
+                               for k in range(len(atoms)) for j in range(k+1, len(atoms))])
+        if not np.allclose(internal, nonperiodic, atol=0.002, rtol=0):
+            raise ValueError(f"Cannot reconstruct ligand as one periodic image: {ligand['id']}")
+        closest = int(np.argmin(md.compute_distances(snapshot, pairs, periodic=True)[0]))
+        receptor_atom, ligand_atom = map(int, pairs[closest])
+        displacement = md.compute_displacements(snapshot, pairs[closest:closest+1], periodic=True)[0, 0]
+        translation = (result.xyz[0, receptor_atom] + displacement
+                       - rebuilt[atoms.index(ligand_atom)])
+        result.xyz[0, atoms, :] = rebuilt + translation
+    after = contact_distances(result, setup, periodic=False)[0]
+    close = before <= max(args.contact_cutoff, args.deep_cutoff)
+    if not np.allclose(before[close], after[close], atol=0.02, rtol=0):
+        raise ValueError("PDB reconstruction changed a close ligand-panel distance; "
+                         "check receptor connectivity and box size")
+    if not np.array_equal(before < args.contact_cutoff, after < args.contact_cutoff):
+        raise ValueError("PDB reconstruction changed a ligand-panel contact mask")
+    # Retain the recorded box in unrotated coordinates; no structural fit is applied.
+    return result
+
+
+def criteria(args):
+    return {
+        "label_status": "heuristic candidates for structural inspection; not paper MSM states",
+        "contact_cutoff_A_strict_less_than": args.contact_cutoff,
+        "deep_F155_cutoff_A_less_than_or_equal": args.deep_cutoff,
+        "associated": "F155 distance <= deep cutoff AND minimum pocket contact count",
+        "intermediate": "not associated AND minimum total contacts AND >=1 gate-anchor contact",
+        "pocket_residues": list(POCKET_RESIDUES), "gate_anchor_residues": list(GATE_RESIDUES),
+        "minimum_pocket_contacts": args.min_pocket_contacts,
+        "minimum_intermediate_total_contacts": args.min_intermediate_contacts,
+        "contact_mask_noncontact_value_A": 999,
+        "no_panel_contact_is_not_proof_of_dissociation": True,
+    }
+
+
+def atom_mapping(setup):
+    mapping = []
+    for output_index, input_index in enumerate(setup["keep"]):
+        atom = setup["full_topology"].atom(int(input_index))
+        out_atom = setup["topology"].atom(output_index)
+        mapping.append({"pdb_atom_order_index0": output_index,
+                        "input_atom_index0": int(input_index), "input_pdb_serial": atom.serial,
+                        "atom_name": atom.name, "resname": atom.residue.name,
+                        "resSeq": atom.residue.resSeq, "input_residue_index0": atom.residue.index,
+                        "input_chain_index0": atom.residue.chain.index,
+                        "output_chain_index0": out_atom.residue.chain.index,
+                        "input_chain_id": atom.residue.chain.chain_id,
+                        "output_chain_id": out_atom.residue.chain.chain_id})
+    return mapping
+
+
+def write_snapshot(snapshot, path, remarks):
+    # For a one-chain output MDTraj may retain source serials. Assign unique
+    # serials first, then record the actual emitted identifiers (including TER).
+    for index, atom in enumerate(snapshot.topology.atoms):
+        atom.serial = index + 1
+    snapshot.save_pdb(str(path), force_overwrite=False)
+    text = path.read_text()
+    lines = [f"REMARK 900 {line}" for line in remarks]
+    path.write_text("\n".join(lines) + "\n" + text)
+
+
+def record_pdb_mapping(path, manifest):
+    """Capture actual PDB identifiers, including serial gaps consumed by TER."""
+    records = [line for line in path.read_text().splitlines()
+               if line.startswith(("ATOM  ", "HETATM"))]
+    mapping = manifest["pdb_atom_mapping"]
+    if len(records) != len(mapping):
+        raise ValueError(f"Written PDB atom count differs from manifest: {path}")
+    for entry, line in zip(mapping, records):
+        entry.update(pdb_atom_serial1=int(line[6:11]),
+                     pdb_atom_name=line[12:16].strip(), pdb_resname=line[17:20].strip(),
+                     pdb_chain_id=line[21:22].strip(),
+                     pdb_resSeq=int(line[22:26]))
+    manifest["pdb_atom_mapping_example"] = str(path)
+
+
+def process_run(args, setup, xtc):
+    run_dir = args.output_root / setup["name"] / xtc.stem
+    run_dir.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        "status": "running", "script_version": VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "setup": setup["name"], "topology": str(setup["pdb"]), "trajectory": str(xtc),
+        "topology_sha256": sha256(setup["pdb"]), "script_sha256": sha256(Path(__file__)),
+        "trajectory_size_bytes": xtc.stat().st_size, "trajectory_mtime_ns": xtc.stat().st_mtime_ns,
+        "input_atoms": setup["full_topology"].n_atoms, "output_atoms": setup["topology"].n_atoms,
+        "receptor_chain_id": setup["chain_id"], "receptor_chain_index0": setup["chain_index0"],
+        "panel_residues": PANEL, "ligands": setup["ligands"], "criteria": criteria(args),
+        "stride": args.stride, "chunk_frames": args.chunk,
+        "frame_numbering": "frame0 is zero-based in the supplied stripped XTC; frame1=frame0+1",
+        "original_unstripped_frame_mapping": "unknown; not inferred from the skip100 filename",
+        "periodic_distances": not args.no_pbc,
+        "pdb_contents": "all receptor atoms and all detected C3/C7 atoms; no lipids/water/ions",
+        "selected_frames_pdb_path_base": str(args.output_root),
+        "pdb_atom_mapping": atom_mapping(setup),
+        "selection": {"method": "uniform reservoir of unique eligible frames per run/category",
+                      "maximum_frames_per_category": args.max_pdb_per_category, "seed": args.seed},
+        "software": {"python": platform.python_version(), "mdtraj": md.__version__, "numpy": np.__version__},
+    }
+    manifest_path = run_dir / "manifest.json"
+    dump_json(manifest_path, manifest)
+    categories = all_categories(SETUPS[setup["name"]])
+    reservoirs = {}
+    for category in categories:
+        seed = int.from_bytes(hashlib.sha256(
+            f"{args.seed}:{setup['name']}:{xtc.name}:{category}".encode()).digest()[:8], "big")
+        reservoirs[category] = Reservoir(args.max_pdb_per_category, seed)
+    fields = ["setup", "trajectory", "topology", "frame0", "frame1", "time_ps", "time_ns",
+              "ligand_id", "species", "resname", "resSeq", "input_residue_index0", "state",
+              "n_panel_contacts", "n_pocket_contacts", "n_gate_anchor_contacts", "contact_residues"]
+    fields += [f"d_{n}_A" for n in PANEL_NUMBERS] + [f"contact_d_{n}_A" for n in PANEL_NUMBERS]
+    state_counts, nframes = Counter(), 0
+    try:
+        with gzip.open(run_dir / "frame_metrics.csv.gz", "wt", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for chunk in md.iterload(str(xtc), top=setup["full_topology"], chunk=args.chunk,
+                                     stride=args.stride, atom_indices=setup["keep"]):
+                validate_box(chunk, xtc, args.no_pbc)
+                distances = contact_distances(chunk, setup, periodic=not args.no_pbc)
+                labels, pocket, gate, total = classify_distances(distances, args)
+                for k in range(chunk.n_frames):
+                    frame0 = nframes * args.stride
+                    time_ps = float(chunk.time[k])
+                    for j, ligand in enumerate(setup["ligands"]):
+                        values = distances[k, j]
+                        mask = values < args.contact_cutoff
+                        state = str(labels[k, j])
+                        state_counts[f"{ligand['species']}:{state}"] += 1
+                        row = dict(setup=setup["name"], trajectory=str(xtc), topology=str(setup["pdb"]),
+                                   frame0=frame0, frame1=frame0+1, time_ps=f"{time_ps:.6f}",
+                                   time_ns=f"{time_ps/1000:.9f}", ligand_id=ligand["id"],
+                                   species=ligand["species"], resname=ligand["resname"], resSeq=ligand["resSeq"],
+                                   input_residue_index0=ligand["residue_index0"], state=state,
+                                   n_panel_contacts=int(total[k, j]), n_pocket_contacts=int(pocket[k, j]),
+                                   n_gate_anchor_contacts=int(gate[k, j]),
+                                   contact_residues=";".join(str(n) for n, yes in zip(PANEL_NUMBERS, mask) if yes))
+                        row.update({f"d_{n}_A": f"{v:.6f}" for n, v in zip(PANEL_NUMBERS, values)})
+                        row.update({f"contact_d_{n}_A": f"{v:.6f}" if yes else "999"
+                                    for n, v, yes in zip(PANEL_NUMBERS, values, mask)})
+                        writer.writerow(row)
+                    for category, matches in frame_categories(labels[k], setup["ligands"]).items():
+                        reservoirs[category].add({"frame0": frame0, "time_ps": time_ps, "matches": matches})
+                    nframes += 1
+                if nframes % (args.chunk * 10) == 0:
+                    log(f"  {xtc.name}: analyzed {nframes} frames")
+        if nframes == 0:
+            raise ValueError(f"No trajectory frames: {xtc}")
+        requested = {}
+        for category, reservoir in reservoirs.items():
+            (run_dir / "pdbs" / category).mkdir(parents=True)
+            for item in reservoir.items:
+                requested.setdefault(item["frame0"], []).append((category, item))
+        output_fields = ["setup", "trajectory", "topology", "category", "label_status",
+                         "frame0", "frame1", "time_ps", "time_ns", "ligand_id", "species", "state",
+                         "C3_ligand_id", "C3_state", "C7_ligand_id", "C7_state", "pdb_path"]
+        selected_rows, exported_counts = Counter(), Counter()
+        with (run_dir / "selected_frames.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=output_fields)
+            writer.writeheader()
+            # Sorted random-access export reads each selected frame once, even if it
+            # belongs to several categories. XTC maintains a frame offset index.
+            with XTCTrajectoryFile(str(xtc), "r") as reader:
+                for frame0 in sorted(requested):
+                    reader.seek(frame0)
+                    raw = reader.read_as_traj(setup["full_topology"], n_frames=1, atom_indices=setup["keep"])
+                    validate_box(raw, xtc, args.no_pbc)
+                    snapshot = reconstruct_snapshot(raw, setup, args)
+                    for category, item in requested[frame0]:
+                        if not np.isclose(float(raw.time[0]), item["time_ps"], atol=0.01, rtol=0):
+                            raise ValueError("Export frame/time mismatch; input may have changed")
+                        pdb_path = run_dir / "pdbs" / category / f"frame_{frame0:09d}.pdb"
+                        write_snapshot(snapshot, pdb_path,
+                                       ["HEURISTIC STATE CANDIDATE; INSPECT LIGAND POSE",
+                                        f"SOURCE {xtc.name}", f"FRAME0 {frame0} FRAME1 {frame0+1}",
+                                        f"TIME_PS {item['time_ps']:.6f}", f"CATEGORY {category}",
+                                        "FOCAL LIGAND IDS AND ATOM MAPPING: SELECTED_FRAMES.CSV / MANIFEST.JSON"])
+                        if "pdb_atom_mapping_example" not in manifest:
+                            record_pdb_mapping(pdb_path, manifest)
+                        exported_counts[category] += 1
+                        for match in item["matches"]:
+                            row = dict(setup=setup["name"], trajectory=str(xtc), topology=str(setup["pdb"]),
+                                       category=category, label_status="heuristic_candidate",
+                                       frame0=frame0, frame1=frame0+1, time_ps=f"{item['time_ps']:.6f}",
+                                       time_ns=f"{item['time_ps']/1000:.9f}",
+                                       pdb_path=str(pdb_path.relative_to(args.output_root)))
+                            for ligand_index in match:
+                                ligand = setup["ligands"][ligand_index]
+                                species = ligand["species"]
+                                state = next(s for s in CANDIDATES
+                                             if f"{species}_{s.removesuffix('_candidate')}" in category)
+                                row[f"{species}_ligand_id"] = ligand["id"]
+                                row[f"{species}_state"] = state
+                                if len(match) == 1:
+                                    row.update(ligand_id=ligand["id"], species=species, state=state)
+                            writer.writerow(row)
+                            selected_rows[category] += 1
+        with (run_dir / "selected_frames.csv").open(newline="") as check_handle:
+            saved_rows = Counter(row["category"] for row in csv.DictReader(check_handle))
+        if any(saved_rows[category] != selected_rows[category] for category in categories):
+            raise OSError("Saved frame index row counts differ from completed PDB export")
+        summary = {"setup": setup["name"], "trajectory": str(xtc), "analyzed_frames": nframes,
+                   "ligand_state_row_counts": dict(state_counts),
+                   "categories": {category: {"eligible_frames": reservoirs[category].seen,
+                                               "exported_frames": exported_counts[category],
+                                               "selected_ligand_or_pair_rows": selected_rows[category]}
+                                  for category in categories},
+                   "note": "Frame/ligand counts are not binding event counts or equilibrium populations."}
+        dump_json(run_dir / "summary.json", summary)
+        manifest["status"] = "complete"
+        manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        manifest["analyzed_frames"] = nframes
+        dump_json(manifest_path, manifest)
+        log(f"  {xtc.name}: complete, {nframes} analyzed frames, {sum(exported_counts.values())} PDBs")
+        return summary
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["error"] = str(exc)
+        dump_json(manifest_path, manifest)
+        raise
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-root", type=Path, default=Path.home()/"OR51_gate"/"Stripped_Trajs")
+    parser.add_argument("--output-root", type=Path, default=Path.home()/"OR51_gate"/"State_Snapshots")
+    parser.add_argument("--setups", nargs="+", choices=list(SETUPS), default=list(SETUPS))
+    parser.add_argument("--expected-runs", type=int, default=5)
+    parser.add_argument("--chunk", type=int, default=100)
+    parser.add_argument("--stride", type=int, default=1, help="Analyze every Nth stored XTC frame (default all)")
+    parser.add_argument("--max-pdb-per-category", type=int, default=20, help="Per trajectory/category; 0 exports all")
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--contact-cutoff", type=float, default=4.5, help="Strict heavy-atom contact cutoff in A")
+    parser.add_argument("--deep-cutoff", type=float, default=6.0, help="Heuristic maximum ligand-F155 distance in A")
+    parser.add_argument("--min-pocket-contacts", type=int, default=2)
+    parser.add_argument("--min-intermediate-contacts", type=int, default=2)
+    parser.add_argument("--chain-id", help="Receptor PDB chain ID, only needed if chain matching is ambiguous")
+    parser.add_argument("--no-pbc", action="store_true", help="Only for already whole/unwrapped trajectories")
+    parser.add_argument("--dry-run", action="store_true", help="Validate topologies/first XTC frames, write nothing")
+    args = parser.parse_args(argv)
+    for field in ("expected_runs", "chunk", "stride", "min_pocket_contacts", "min_intermediate_contacts"):
+        if getattr(args, field) < 1:
+            parser.error(f"--{field.replace('_', '-')} must be positive")
+    if args.max_pdb_per_category < 0:
+        parser.error("--max-pdb-per-category must be >=0")
+    if (not np.isfinite([args.contact_cutoff, args.deep_cutoff]).all()
+            or min(args.contact_cutoff, args.deep_cutoff) <= 0):
+        parser.error("Distance cutoffs must be finite and positive")
+    if args.min_pocket_contacts > len(POCKET_RESIDUES) or args.min_intermediate_contacts > len(PANEL):
+        parser.error("Requested contact count exceeds the available residue set")
+    if len(set(args.setups)) != len(args.setups):
+        parser.error("Duplicate --setups entries")
+    args.input_root = args.input_root.expanduser().resolve()
+    args.output_root = args.output_root.expanduser().resolve()
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    log("OR51E2 candidate structure extraction (no MSM)")
+    log("Labels are adjustable geometric candidates; inspect PDB poses before interpreting them as states.")
+    setups = [prepare_setup(args, name) for name in args.setups]
+    if args.dry_run:
+        log("Dry run passed. No output files were written.")
+        return 0
+    if args.output_root.exists() and any(args.output_root.iterdir()):
+        raise FileExistsError(f"Output root is not empty: {args.output_root}. Use a new --output-root.")
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    with (args.output_root / "run_summary.csv").open("w", newline="") as summary_handle, \
+            (args.output_root / "selected_frames_all.csv").open("w", newline="") as master_handle:
+        writer = csv.DictWriter(summary_handle, fieldnames=["setup", "trajectory", "analyzed_frames", "category",
+                                                    "eligible_frames", "exported_frames", "selected_ligand_or_pair_rows"])
+        writer.writeheader()
+        master_writer = None
+        for setup in setups:
+            for xtc in setup["xtcs"]:
+                summary = process_run(args, setup, xtc)
+                index_path = args.output_root / setup["name"] / xtc.stem / "selected_frames.csv"
+                with index_path.open(newline="") as index_handle:
+                    index_reader = csv.DictReader(index_handle)
+                    if master_writer is None:
+                        master_writer = csv.DictWriter(master_handle, fieldnames=index_reader.fieldnames)
+                        master_writer.writeheader()
+                    copied = Counter()
+                    for row in index_reader:
+                        master_writer.writerow(row)
+                        copied[row["category"]] += 1
+                if any(copied[category] != values["selected_ligand_or_pair_rows"]
+                       for category, values in summary["categories"].items()):
+                    raise OSError(f"Saved frame index is incomplete: {index_path}")
+                for category, values in summary["categories"].items():
+                    writer.writerow(dict(setup=summary["setup"], trajectory=summary["trajectory"],
+                                         analyzed_frames=summary["analyzed_frames"], category=category, **values))
+                summary_handle.flush()
+                master_handle.flush()
+    log(f"Finished. Results: {args.output_root}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"ERROR: {error}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.exit(1)
