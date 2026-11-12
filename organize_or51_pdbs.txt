@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Collect the four single-species categories across five replicas per setup.
+# Default operation is MOVE. Use --copy to preserve the source PDB files.
+#
+# Input example:
+#   State_Snapshots/OR51E2_C3_vs_C7/run3-skip100_nowater/
+#     pdbs/C3_intermediate/frame_000000123.pdb
+# Output:
+#   State_Snapshots/OR51E2_C3_vs_C7/PDBs_by_state/
+#     C3_intermediate/traj3_frame_000000123.pdb
+#
+# PDBs_by_state is a sibling of the five run folders, within EACH setup.
+# Only existing single-species PDB exports are collected. Joint-category
+# folders are not processed. PDB contents and state assignments are unchanged.
+# All four destination categories are created, even when a category is empty.
+# file_map.tsv records old/new paths relative to the State_Snapshots root.
+# In move mode, use that map to resolve the old paths in the extraction CSVs.
+# The original CSV/JSON files and joint-category exports remain in place.
+#
+# Requires Bash >=4 and ordinary GNU/Linux coreutils. No Python/MD software.
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+usage() {
+    cat <<'USAGE'
+Usage: bash organize_or51_pdbs.sh [--dry-run] [--copy|--move] [RESULTS_ROOT]
+
+RESULTS_ROOT defaults to $HOME/OR51_gate/State_Snapshots.
+It must contain OR51E2_C3, OR51E2_C7, and OR51E2_C3_vs_C7.
+Each setup must have run1 ... run5 directories, optionally with a suffix
+such as run1-skip100_nowater, and the usual pdbs/category/ structure.
+
+Examples:
+  bash organize_or51_pdbs.sh --dry-run "$HOME/OR51_gate/State_Snapshots"
+  bash organize_or51_pdbs.sh "$HOME/OR51_gate/State_Snapshots"
+  bash organize_or51_pdbs.sh --copy /path/to/State_Snapshots
+
+Default: move PDBs into <setup>/PDBs_by_state/<category>/trajX_<original>.pdb
+Four categories: C3_associated, C3_intermediate, C7_associated, C7_intermediate.
+The five runs are pooled within each setup; the three setups remain separate.
+The script never overwrites existing PDBs. It checks all inputs and name
+collisions before transferring files. An interrupted run can be restarted:
+already-moved source files are absent and existing mapping rows are retained.
+After a completed move, rerunning moves zero files and keeps the existing map.
+Copy-mode reruns encounter existing destinations and stop without overwriting.
+Do not run concurrent organizers or change input files while it is running.
+USAGE
+}
+
+((BASH_VERSINFO[0] >= 4)) || die 'Bash 4 or newer is required.'
+mode=move
+dry_run=0
+root_arg=''
+while (($#)); do
+    case "$1" in
+        --dry-run) dry_run=1 ;;
+        --copy) mode=copy ;;
+        --move) mode=move ;;
+        -h|--help) usage; exit 0 ;;
+        --)
+            shift
+            (($# == 1)) || die 'Expected one results-root path after --.'
+            [[ -z "$root_arg" ]] || die 'Only one results-root path is allowed.'
+            root_arg=$1
+            shift
+            break
+            ;;
+        -*) die "Unknown option: $1" ;;
+        *) [[ -z "$root_arg" ]] || die 'Only one results-root path is allowed.'
+           root_arg=$1 ;;
+    esac
+    shift
+done
+root_arg=${root_arg:-"$HOME/OR51_gate/State_Snapshots"}
+[[ -d "$root_arg" ]] || die "Results root not found: $root_arg"
+root=$(cd -- "$root_arg" && pwd -P)
+[[ "$root" != *$'\t'* && "$root" != *$'\n'* && "$root" != *$'\r'* ]] || die 'Root path cannot contain tabs or line breaks.'
+
+setups=(OR51E2_C3 OR51E2_C7 OR51E2_C3_vs_C7)
+categories=(C3_associated C3_intermediate C7_associated C7_intermediate)
+map_header=$'setup\ttrajectory_tag\trun_folder\tcategory\toriginal_pdb_path\torganized_pdb_path\toperation'
+declare -a sources=() targets=() record_setups=() record_tags=() record_runs=() record_categories=()
+declare -A counts=() seen_targets=()
+
+# Complete preflight over all three setups before creating/moving anything.
+for setup in "${setups[@]}"; do
+    setup_dir="$root/$setup"
+    [[ -d "$setup_dir" && ! -L "$setup_dir" ]] || die "Missing setup directory or symlink: $setup_dir"
+    pool="$setup_dir/PDBs_by_state"
+    [[ ! -L "$pool" ]] || die "Destination cannot be a symlink: $pool"
+    [[ ! -e "$pool" || -d "$pool" ]] || die "Destination is not a directory: $pool"
+    if [[ -e "$pool/file_map.tsv" || -L "$pool/file_map.tsv" ]]; then
+        [[ -f "$pool/file_map.tsv" && ! -L "$pool/file_map.tsv" ]] || die "Invalid mapping file: $pool/file_map.tsv"
+        IFS= read -r header < "$pool/file_map.tsv" || die "Empty mapping file: $pool/file_map.tsv"
+        [[ "$header" == "$map_header" ]] || die "Unexpected mapping header: $pool/file_map.tsv"
+    fi
+    for category in "${categories[@]}"; do
+        dest_dir="$pool/$category"
+        [[ ! -L "$dest_dir" ]] || die "Destination cannot be a symlink: $dest_dir"
+        [[ ! -e "$dest_dir" || -d "$dest_dir" ]] || die "Destination is not a directory: $dest_dir"
+        counts["$setup/$category"]=0
+    done
+
+    declare -A run_dirs=()
+    for candidate in "$setup_dir"/run*; do
+        [[ -d "$candidate" ]] || continue
+        run_name=${candidate##*/}
+        [[ "$run_name" =~ ^run([1-5])($|[-_].*) ]] || continue
+        number=${BASH_REMATCH[1]}
+        [[ ! -L "$candidate" ]] || die "Run directory cannot be a symlink: $candidate"
+        [[ -z "${run_dirs[$number]+present}" ]] || die "Multiple run$number folders in $setup_dir"
+        run_dirs[$number]=$candidate
+    done
+    for number in 1 2 3 4 5; do
+        [[ -n "${run_dirs[$number]+present}" ]] || die "Missing run$number folder in $setup_dir"
+        run_dir=${run_dirs[$number]}
+        run_name=${run_dir##*/}
+        [[ "$run_name" != *$'\t'* && "$run_name" != *$'\n'* && "$run_name" != *$'\r'* ]] || die "Unsupported run name: $run_name"
+        [[ -d "$run_dir/pdbs" && ! -L "$run_dir/pdbs" ]] || die "Missing pdbs directory or symlink: $run_dir/pdbs"
+        for category in "${categories[@]}"; do
+            # Pure setups have no export folders for the absent species.
+            if [[ "$setup" == OR51E2_C3 && "$category" == C7_* ]] ||
+               [[ "$setup" == OR51E2_C7 && "$category" == C3_* ]]; then
+                continue
+            fi
+            source_dir="$run_dir/pdbs/$category"
+            [[ -d "$source_dir" && ! -L "$source_dir" ]] || die "Missing category directory or symlink: $source_dir"
+            for source in "$source_dir"/*.pdb; do
+                [[ -f "$source" && ! -L "$source" ]] || die "Expected a regular PDB: $source"
+                filename=${source##*/}
+                [[ "$filename" != *$'\t'* && "$filename" != *$'\n'* && "$filename" != *$'\r'* ]] || die "Unsupported PDB filename: $filename"
+                target="$pool/$category/traj${number}_$filename"
+                [[ ! -e "$target" && ! -L "$target" ]] || die "Destination already exists (nothing moved): $target"
+                [[ -z "${seen_targets[$target]+present}" ]] || die "Duplicate planned destination: $target"
+                seen_targets[$target]=1
+                sources+=("$source")
+                targets+=("$target")
+                record_setups+=("$setup")
+                record_tags+=("traj$number")
+                record_runs+=("$run_name")
+                record_categories+=("$category")
+                key="$setup/$category"
+                counts[$key]=$(( ${counts[$key]} + 1 ))
+            done
+        done
+    done
+    unset run_dirs
+done
+
+printf 'Results root: %s\nOperation: %s\n' "$root" "$mode"
+printf '%-19s %-19s %8s\n' 'Setup' 'Category' 'PDBs'
+for setup in "${setups[@]}"; do
+    for category in "${categories[@]}"; do
+        printf '%-19s %-19s %8s\n' "$setup" "$category" "${counts[$setup/$category]}"
+    done
+done
+printf 'Total PDBs to %s: %d\n' "$mode" "${#sources[@]}"
+if ((dry_run)); then
+    printf 'Dry run finished. No files or folders were changed.\n'
+    exit 0
+fi
+
+for setup in "${setups[@]}"; do
+    pool="$root/$setup/PDBs_by_state"
+    for category in "${categories[@]}"; do mkdir -p -- "$pool/$category"; done
+    if [[ ! -e "$pool/file_map.tsv" ]]; then
+        printf '%s\n' "$map_header" > "$pool/file_map.tsv"
+    fi
+done
+
+for index in "${!sources[@]}"; do
+    source=${sources[$index]}
+    target=${targets[$index]}
+    # -n protects against clobbering if a destination appears after preflight.
+    if [[ "$mode" == move ]]; then
+        mv -n -T -- "$source" "$target"
+        [[ ! -e "$source" && -f "$target" ]] || die "Move did not complete: $source -> $target"
+    else
+        cp -p -n -T -- "$source" "$target"
+        cmp -s -- "$source" "$target" || die "Copied PDB does not match source: $target"
+    fi
+    setup=${record_setups[$index]}
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$setup" "${record_tags[$index]}" "${record_runs[$index]}" \
+        "${record_categories[$index]}" "${source#"$root/"}" "${target#"$root/"}" "$mode" \
+        >> "$root/$setup/PDBs_by_state/file_map.tsv"
+done
+printf 'Finished: %d PDBs %s.\n' "${#sources[@]}" "$([[ "$mode" == move ]] && printf moved || printf copied)"
+printf 'Each setup now contains PDBs_by_state/ with four category folders and file_map.tsv.\n'
+if [[ "$mode" == move ]]; then
+    printf 'The extraction CSVs retain their original paths; file_map.tsv links them to the moved PDBs.\n'
+fi
