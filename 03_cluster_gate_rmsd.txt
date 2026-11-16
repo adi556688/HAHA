@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""Cluster OR51 gate candidates in two reference-RMSD descriptors.
+
+This is GROMOS-style clustering in a TWO-DIMENSIONAL FEATURE SPACE, not
+pairwise Cartesian structural RMSD clustering. Coordinates and cutoffs are Å.
+Every structure is fitted once on TM1--TM4 CA atoms. The two descriptors are
+CA(TM5+TM7) RMSD and CB(gate residues) RMSD relative to the common reference.
+The representative is an actual sampled frame minimizing summed Euclidean
+feature distances within its cluster. See README for scientific limitations.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import csv
+import gzip
+from datetime import datetime, timezone
+import hashlib
+import heapq
+import json
+from pathlib import Path
+import platform
+import re
+import shutil
+import sys
+
+import numpy as np
+import scipy
+from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist
+import openpyxl
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+VERSION = "1.0.0"
+SCRIPT = "03_cluster_gate_rmsd.py"
+AA = dict(zip(
+    "ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split(),
+    "ARNDCQEGHILKMFPSTWYV"))
+for _name in ("HID", "HIE", "HIP", "HSD", "HSE", "HSP"):
+    AA[_name] = "H"
+AA.update({"CYX": "C", "CYM": "C", "ASH": "D", "GLH": "E", "LYN": "K", "MSE": "M"})
+STATES = ("gate_entrance_capture", "gate_partial_insertion")
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def dump(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def write_csv(path, rows, columns):
+    with Path(path).open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def natural_key(value):
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", str(value))]
+
+
+def read_residue_table(path, receptor, sheet=None):
+    """Read listed residues, never fill unlisted sequence gaps as helix atoms."""
+    book = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    matches = []
+    try:
+        for ws in book:
+            if sheet and ws.title != sheet:
+                continue
+            rows = list(ws.values)
+            for number, row in enumerate(rows[:20]):
+                for col, value in enumerate(row):
+                    if value and str(value).strip().split()[0].upper() == receptor.upper():
+                        matches.append((ws.title, rows, number, col, str(value)))
+        if len(matches) != 1:
+            raise ValueError(f"Expected one column for {receptor}; found {len(matches)}. "
+                             "Use --sheet if the workbook has duplicate receptor tables.")
+        title, rows, header, col, label = matches[0]
+        sections, generics, identities = {}, {}, {}
+        section = None
+        for row in rows[header + 1:]:
+            tag = str(row[0] or "").strip().upper()
+            if re.fullmatch(r"(?:TM[1-7]|[EI]CL[1-3]|H8)", tag):
+                section = tag
+                sections.setdefault(section, [])
+                continue
+            value = row[col] if len(row) > col else None
+            if not value or str(value).strip() in ("-", "—"):
+                continue
+            if not re.fullmatch(r"\d+[xX]\d+", tag):
+                continue
+            match = re.fullmatch(r"([A-Za-z])(\d+)", str(value).strip())
+            if not match or section is None:
+                raise ValueError(f"Malformed table cell {title}, {tag}: {value!r}")
+            letter, resid = match.group(1).upper(), int(match.group(2))
+            generic = tag.lower()
+            if generic in generics or resid in identities:
+                raise ValueError(f"Duplicate generic position or residue in table: {tag} {value}")
+            generics[generic] = resid
+            identities[resid] = letter
+            sections[section].append(resid)
+        return {"sheet": title, "column": label, "segments": sections,
+                "generic_to_residue": generics, "identities": identities}
+    finally:
+        book.close()
+
+
+class PDB:
+    """Minimal fixed-column PDB reader that preserves all original records."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lines = self.path.read_text().splitlines(keepends=True)
+        self.atoms = []
+        self.chains = {}
+        models = sum(line.startswith("MODEL ") for line in self.lines)
+        if models > 1:
+            raise ValueError(f"Multiple PDB models are not supported: {self.path}")
+        for line_number, line in enumerate(self.lines):
+            if line[:6].strip() not in ("ATOM", "HETATM"):
+                continue
+            try:
+                atom = dict(line=line_number, name=line[12:16].strip(), alt=line[16:17],
+                            resname=line[17:20].strip(), chain=line[21:22],
+                            resid=int(line[22:26]), icode=line[26:27],
+                            xyz=np.array([float(line[30:38]), float(line[38:46]), float(line[46:54])]))
+            except (ValueError, IndexError) as exc:
+                raise ValueError(f"Malformed PDB atom at {self.path}:{line_number + 1}") from exc
+            if not np.isfinite(atom["xyz"]).all():
+                raise ValueError(f"Nonfinite coordinates: {self.path}:{line_number + 1}")
+            self.atoms.append(atom)
+            if atom["resname"] in AA:
+                self.chains.setdefault(atom["chain"], []).append(atom)
+        if not self.atoms:
+            raise ValueError(f"No atoms in {self.path}")
+
+    def select_chain(self, required_ca, requested=None):
+        if requested is not None:
+            requested = " " if requested in ("_", "blank") else requested
+            if requested not in self.chains:
+                raise ValueError(f"Chain {requested!r} absent from {self.path}")
+            return requested
+        candidates = []
+        for chain, atoms in self.chains.items():
+            present = {a["resid"] for a in atoms if a["name"] == "CA"}
+            if set(required_ca).issubset(present):
+                candidates.append(chain)
+        if len(candidates) != 1:
+            raise ValueError(f"Cannot uniquely identify receptor chain in {self.path}; "
+                             f"qualifying chains={candidates}. Specify --chain/--reference-chain; "
+                             "also check residue numbering and missing atoms.")
+        return candidates[0]
+
+    def atom_map(self, chain):
+        result = {}
+        for atom in self.chains[chain]:
+            key = (atom["resid"], atom["name"])
+            if atom["icode"].strip():
+                raise ValueError(f"Insertion-coded protein residue in {self.path}: {atom['resid']}{atom['icode']}; "
+                                 "resolve numbering explicitly before analysis.")
+            if key in result:
+                raise ValueError(f"Duplicate/alternate-location protein atom {key} in {self.path}; "
+                                 "supply a single conformation.")
+            result[key] = atom
+        return result
+
+    def write_aligned(self, path, rotation, translation, remarks):
+        changed = {}
+        for atom in self.atoms:
+            xyz = atom["xyz"] @ rotation + translation
+            fields = [f"{v:8.3f}" for v in xyz]
+            if any(len(v) != 8 for v in fields):
+                raise ValueError("Aligned coordinates exceed PDB field width")
+            line = self.lines[atom["line"]].rstrip("\r\n")
+            changed[atom["line"]] = line[:30] + "".join(fields) + line[54:] + "\n"
+        output = [f"REMARK 900 {text}\n" for text in remarks]
+        output.append("REMARK 900 RIGIDLY ALIGNED; ORIGINAL UNIT CELL AND ANISOTROPIC RECORDS OMITTED\n")
+        for index, line in enumerate(self.lines):
+            tag = line[:6].strip()
+            if tag == "CRYST1" or tag in ("ANISOU", "SIGUIJ") or tag.startswith(("SCALE", "ORIGX")):
+                continue
+            output.append(changed.get(index, line))
+        Path(path).write_text("".join(output))
+
+
+def coords(mapping, keys, source):
+    missing = [f"{res}:{atom}" for res, atom in keys if (res, atom) not in mapping]
+    if missing:
+        raise ValueError(f"Missing required atoms in {source}: {', '.join(missing[:20])}")
+    return np.array([mapping[key]["xyz"] for key in keys], dtype=np.float64)
+
+
+def check_ca_continuity(mapping, source):
+    ca = {r: a["xyz"] for (r, name), a in mapping.items() if name == "CA"}
+    for r in sorted(ca):
+        if r + 1 in ca:
+            distance = float(np.linalg.norm(ca[r + 1] - ca[r]))
+            if distance > 8.0:
+                raise ValueError(f"Backbone discontinuity ({distance:.2f} Å between CA {r}/{r+1}) "
+                                 f"in {source}. Make the receptor whole across PBC first.")
+
+
+def kabsch(mobile, target):
+    if len(mobile) < 3 or np.linalg.matrix_rank(mobile - mobile.mean(0)) < 2:
+        raise ValueError("Alignment selection needs at least three noncollinear atoms")
+    x0, y0 = mobile.mean(0), target.mean(0)
+    u, _, vt = np.linalg.svd((mobile - x0).T @ (target - y0))
+    correction = np.eye(3)
+    correction[-1, -1] = 1.0 if np.linalg.det(u @ vt) >= 0 else -1.0
+    rotation = u @ correction @ vt
+    return rotation, y0 - x0 @ rotation
+
+
+def rmsd(a, b):
+    return float(np.sqrt(np.mean(np.sum((a - b) ** 2, axis=1))))
+
+
+def prepare_selection(args):
+    table = read_residue_table(args.residue_table, args.receptor, args.sheet)
+    def residues_for(segments):
+        missing = [s for s in segments if not table["segments"].get(s)]
+        if missing:
+            raise ValueError(f"No listed residues for table segments: {missing}")
+        numbers = [r for s in segments for r in table["segments"][s]]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError("Overlapping or duplicate segment selections")
+        return numbers
+    fit = residues_for(args.fit_segments)
+    measured = residues_for(args.rmsd_segments)
+    if args.gate_residues:
+        gates = args.gate_residues
+        gate_rule = "explicit --gate-residues"
+    else:
+        if not table["segments"].get("ECL2"):
+            raise ValueError("Table has no ECL2 residues; use --gate-residues")
+        if args.gate_generic.lower() not in table["generic_to_residue"]:
+            raise ValueError(f"Generic position {args.gate_generic} is missing; use --gate-residues")
+        end = max(table["segments"]["ECL2"])
+        gates = [table["generic_to_residue"][args.gate_generic.lower()], end, end + 1]
+        gate_rule = f"{args.gate_generic}, last listed ECL2 residue, last listed ECL2 residue + 1"
+    if len(set(gates)) != 3:
+        raise ValueError("Three distinct gate residues are required")
+    required = sorted(set(fit + measured + gates))
+    ref = PDB(args.reference)
+    chain = ref.select_chain(required, args.reference_chain)
+    mapping = ref.atom_map(chain)
+    check_ca_continuity(mapping, ref.path)
+    fit_keys = [(r, "CA") for r in fit]
+    measured_keys = [(r, "CA") for r in measured]
+    gate_keys, substitutions = [], []
+    for r in gates:
+        if (r, "CB") in mapping:
+            gate_keys.append((r, "CB"))
+        elif args.missing_cb == "ca" and (r, "CA") in mapping and AA[mapping[r, "CA"]["resname"]] == "G":
+            gate_keys.append((r, "CA"))
+            substitutions.append(f"GLY {r}: CA explicitly substituted for absent CB")
+        else:
+            raise ValueError(f"Reference lacks CB at gate residue {r}. For glycine only, "
+                             "--missing-cb ca explicitly enables CA substitution.")
+    keys = fit_keys + measured_keys + gate_keys
+    identities = {}
+    for r, atom_name in keys:
+        coords(mapping, [(r, atom_name)], ref.path)
+        found = AA[mapping[r, atom_name]["resname"]]
+        expected = table["identities"].get(r)
+        if expected and found != expected and not args.allow_mutations:
+            raise ValueError(f"Reference residue {r} is {found}, table expects {expected}; "
+                             "check numbering or explicitly use --allow-mutations")
+        identities[r] = found
+    record = {"receptor": args.receptor, "table_sheet": table["sheet"], "table_column": table["column"],
+              "listed_segments": table["segments"], "fit_segments": args.fit_segments,
+              "fit_CA_residues": fit, "rmsd_segments": args.rmsd_segments,
+              "rmsd_CA_residues": measured, "gate_residues": gates, "gate_rule": gate_rule,
+              "gate_atoms": [{"resid": r, "name": a, "reference_resname": mapping[r, a]["resname"]}
+                             for r, a in gate_keys], "substitutions": substitutions,
+              "reference_chain": chain, "fit_atom_count": len(fit_keys),
+              "x_atom_count": len(measured_keys), "y_atom_count": len(gate_keys),
+              "reference_residue_identities": identities,
+              "units": "angstrom", "additional_fit_for_descriptors": False,
+              "metric": "Euclidean distance between two reference-RMSD descriptors; equal axis weights; no standardization",
+              "representative": "Exact medoid under the feature-space metric; actual input PDB frame"}
+    return dict(reference=ref, mapping=mapping, fit_keys=fit_keys, measured_keys=measured_keys,
+                gate_keys=gate_keys, required=required, identities=identities, record=record,
+                ref_fit=coords(mapping, fit_keys, ref.path),
+                ref_x=coords(mapping, measured_keys, ref.path), ref_y=coords(mapping, gate_keys, ref.path))
+
+
+def calculate_features(path, selection, args):
+    pdb = PDB(path)
+    chain = pdb.select_chain(selection["required"], args.chain)
+    mapping = pdb.atom_map(chain)
+    check_ca_continuity(mapping, path)
+    for key in selection["fit_keys"] + selection["measured_keys"] + selection["gate_keys"]:
+        if key not in mapping:
+            raise ValueError(f"Missing required atom {key} in {path}")
+        residue = key[0]
+        letter = AA[mapping[key]["resname"]]
+        if letter != selection["identities"][residue] and not args.allow_mutations:
+            raise ValueError(f"Residue identity differs from reference at {residue} in {path}; "
+                             "check numbering or explicitly use --allow-mutations")
+    mobile_fit = coords(mapping, selection["fit_keys"], path)
+    rotation, translation = kabsch(mobile_fit, selection["ref_fit"])
+    x = rmsd(coords(mapping, selection["measured_keys"], path) @ rotation + translation, selection["ref_x"])
+    y = rmsd(coords(mapping, selection["gate_keys"], path) @ rotation + translation, selection["ref_y"])
+    fit_rmsd = rmsd(mobile_fit @ rotation + translation, selection["ref_fit"])
+    return x, y, fit_rmsd, chain, rotation, translation, pdb
+
+
+def gromos(points, cutoff, batch_size=128):
+    """Greedy active-neighbor clustering. No dense N x N distance matrix.
+
+    Counts include self. After removing a cluster, counts of all surviving
+    neighbors are decreased exactly. Seed ties resolve to lowest input index.
+    Each query batch bounds temporary neighbor-list storage.
+    """
+    n = len(points)
+    if n == 0:
+        return []
+    tree = cKDTree(points)
+    counts = np.asarray(tree.query_ball_point(points, cutoff, return_length=True), dtype=np.int64)
+    active = np.ones(n, dtype=bool)
+    # Each active index has one heap entry. Counts only decrease, so stale
+    # priorities are safe upper bounds; update them lazily when they reach top.
+    heap = [(-int(count), i) for i, count in enumerate(counts)]
+    heapq.heapify(heap)
+    remaining_count = n
+    clusters = []
+    while remaining_count:
+        while True:
+            old_negative_count, seed = heapq.heappop(heap)
+            if not active[seed]:
+                continue
+            if -old_negative_count != counts[seed]:
+                heapq.heappush(heap, (-int(counts[seed]), seed))
+                continue
+            break
+        neighbors = np.asarray(tree.query_ball_point(points[seed], cutoff), dtype=np.int64)
+        members = np.sort(neighbors[active[neighbors]])
+        if len(members) == 0:
+            raise RuntimeError("Internal clustering error: seed lost its self neighbor")
+        active[members] = False
+        counts[members] = -1
+        remaining_count -= len(members)
+        clusters.append({"seed": seed, "members": members})
+        if not remaining_count:
+            break
+        for first in range(0, len(members), batch_size):
+            removed = members[first:first + batch_size]
+            touched = tree.query_ball_point(points[removed], cutoff)
+            for indices in touched:
+                indices = np.asarray(indices, dtype=np.int64)
+                remaining = indices[active[indices]]
+                counts[remaining] -= 1
+    return sorted(clusters, key=lambda c: (-len(c["members"]), c["seed"]))
+
+
+def exact_medoid(points, members, block_size):
+    """Compute exact minimum-sum feature distance with bounded block memory."""
+    if len(members) == 1:
+        return int(members[0])
+    local = points[members]
+    totals = np.zeros(len(members), dtype=np.float64)
+    for i in range(0, len(local), block_size):
+        for j in range(0, len(local), block_size):
+            totals[i:i + block_size] += cdist(local[i:i + block_size], local[j:j + block_size]).sum(axis=1)
+    # members are sorted by input order, so argmin makes tie handling repeatable.
+    return int(members[int(np.argmin(totals))])
+
+
+def cutoff_values(args):
+    if args.cutoffs:
+        result = sorted(set(args.cutoffs))
+    else:
+        if args.cutoff_step <= 0 or args.cutoff_max < args.cutoff_min:
+            raise ValueError("Require positive cutoff step and max >= min")
+        count = int(np.floor((args.cutoff_max - args.cutoff_min) / args.cutoff_step + 1e-9)) + 1
+        result = [round(args.cutoff_min + i * args.cutoff_step, 12) for i in range(count)]
+    if not result or not all(np.isfinite(v) and v > 0 for v in result):
+        raise ValueError("All cutoffs must be finite and positive")
+    return result
+
+
+def save_figure(fig, stem):
+    fig.savefig(str(stem) + ".png", dpi=180, bbox_inches="tight")
+    fig.savefig(str(stem) + ".pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_sweep(rows, target, top_n, selected, path, title):
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    cut = [r["cutoff_A"] for r in rows]
+    axes[0].plot(cut, [100 * r["top_n_fraction"] for r in rows], "o-", ms=3)
+    axes[0].axhline(100 * target, color="gray", ls="--")
+    axes[0].set(xlabel="2D feature-distance cutoff (Å)", ylabel=f"Top {top_n} coverage (%)", ylim=(0, 103))
+    axes[1].plot(cut, [r["n_clusters"] for r in rows], "o-", ms=3)
+    axes[1].set(xlabel="2D feature-distance cutoff (Å)", ylabel="Number of clusters")
+    if selected is not None:
+        for ax in axes:
+            ax.axvline(selected, color="#bd3c2b", ls=":", label=f"Selected {selected:g} Å")
+        axes[0].legend(fontsize=8)
+    fig.suptitle(title)
+    save_figure(fig, path)
+
+
+def plot_clusters(points, labels, stats, args, directory, title, cutoff, y_label):
+    fig, ax = plt.subplots(figsize=(7.5, 6), constrained_layout=True)
+    shown = min(args.top_n, len(stats))
+    palette = plt.get_cmap("tab10")
+    other = labels > shown
+    if other.any():
+        ax.scatter(points[other, 0], points[other, 1], c="#bcbcbc", s=12, alpha=.5,
+                   linewidths=0, rasterized=True, label="Other clusters")
+    for rank in range(1, shown + 1):
+        members = labels == rank
+        s = stats[rank - 1]
+        color = palette((rank - 1) % 10)
+        ax.scatter(points[members, 0], points[members, 1], color=color, s=15, alpha=.65,
+                   linewidths=0, rasterized=True, label=f"C{rank}: {s['population_percent']:.1f}%")
+    for s in stats[:shown]:
+        rank = s["cluster"]
+        ax.scatter(s["medoid_x_A"], s["medoid_y_A"], marker="*", s=220,
+                   facecolor=palette((rank - 1) % 10), edgecolor="black", linewidth=.8, zorder=5)
+        ax.annotate(str(rank), (s["medoid_x_A"], s["medoid_y_A"]), xytext=(7, 7),
+                    textcoords="offset points", fontsize=9, weight="bold")
+    if len(stats) > shown:
+        ax.scatter([s["medoid_x_A"] for s in stats[shown:]],
+                   [s["medoid_y_A"] for s in stats[shown:]], marker="x", s=12,
+                   c="#555555", linewidth=.5, alpha=.55, rasterized=True)
+    ax.set(xlabel="Reference RMSD: CA (" + "+".join(args.rmsd_segments) + ") (Å)",
+           ylabel=y_label, title=f"{title}\n2D cutoff {cutoff:g} Å; stars = top-{shown} medoids")
+    ax.legend(fontsize=8, loc="best", framealpha=.9)
+    ax.grid(alpha=.15)
+    save_figure(fig, directory / "rmsd_2d_clusters")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    fractions = np.array([s["population_percent"] for s in stats])
+    nbar = min(20, len(stats))
+    axes[0].bar(np.arange(1, nbar + 1), fractions[:nbar], color="#287eaa")
+    axes[0].set(xlabel="Cluster rank", ylabel="Selected frames (%)", title=f"Top {nbar} of {len(stats)} clusters")
+    axes[0].set_xlim(.5, nbar + .5)
+    axes[0].xaxis.set_major_locator(MaxNLocator(integer=True))
+    axes[1].plot(np.arange(1, len(stats) + 1), np.cumsum(fractions), color="#287eaa")
+    axes[1].axhline(100 * args.target_coverage, color="gray", ls="--")
+    axes[1].axvline(min(args.top_n, len(stats)), color="gray", ls=":")
+    axes[1].set(xlabel="Top N clusters", ylabel="Cumulative selected frames (%)", ylim=(0, 103))
+    axes[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+    fig.suptitle(f"{title} | selected cutoff {cutoff:g} Å")
+    save_figure(fig, directory / "cluster_populations")
+
+
+def read_metadata(pool, category):
+    path = pool / "file_map.tsv"
+    if not path.is_file():
+        return {}
+    with path.open(newline="") as stream:
+        result = {}
+        for row in csv.DictReader(stream, delimiter="\t"):
+            if row.get("category") != category:
+                continue
+            name = Path(row.get("organized_pdb_path", "")).name
+            if not name:
+                continue
+            if name in result:
+                raise ValueError(f"Duplicate mapping row for {category}/{name} in {path}")
+            result[name] = row
+        return result
+
+
+def feature_rows(paths, metadata, selection, args):
+    rows = []
+    for i, path in enumerate(paths):
+        checksum = digest(path)
+        meta = metadata.get(path.name, {})
+        if meta.get("sha256") and meta["sha256"] != checksum:
+            raise ValueError(f"PDB differs from organizer file_map.tsv checksum: {path}. "
+                             "Restore the organized file or rerun organization into a new directory.")
+        x, y, fit, chain, _, _, _ = calculate_features(path, selection, args)
+        tag = meta.get("trajectory_tag") or (re.search(r"(?:^|_)traj(\d+)(?:_|$)", path.name).group(0).strip("_")
+                                              if re.search(r"(?:^|_)traj(\d+)(?:_|$)", path.name) else "unknown")
+        frame_match = re.search(r"frame_(\d+)", path.name)
+        rows.append({"observation_index0": i, "pdb_name": path.name, "pdb_path": str(path),
+                     "sha256": checksum, "trajectory_tag": tag,
+                     "frame0": meta.get("frame0", "") or (int(frame_match.group(1)) if frame_match else ""),
+                     "time_ps": meta.get("time_ps", ""), "protein_chain": chain,
+                     "rmsd_CA_A": x, "rmsd_gate_A": y, "fit_CA_RMSD_A": fit,
+                     "organizer_metadata_json": json.dumps(meta, sort_keys=True)})
+        if (i + 1) % 500 == 0:
+            log(f"  Read/aligned {i+1}/{len(paths)} PDBs")
+    return rows
+
+
+def cluster_group(paths, metadata, selection, args, directory, title):
+    directory.mkdir(parents=True, exist_ok=False)
+    small_sample = len(paths) * args.target_coverage <= args.top_n
+    if small_sample:
+        log(f"  WARNING: only {len(paths)} frames. Top-{args.top_n} coverage can meet {args.target_coverage:.0%} "
+            "even with singleton clusters; this criterion does not establish convergence.")
+    export_caps = sorted({int(row["export_cap"]) for row in metadata.values()
+                          if str(row.get("export_cap", "")).isdigit() and int(row["export_cap"]) > 0})
+    if export_caps:
+        log(f"  WARNING: input metadata records finite extraction caps {export_caps}; "
+            "populations describe exported frames, not every eligible frame.")
+    rows = feature_rows(paths, metadata, selection, args)
+    feature_columns = list(rows[0])
+    write_csv(directory / "rmsd_features.csv", rows, feature_columns)
+    points = np.array([[r["rmsd_CA_A"], r["rmsd_gate_A"]] for r in rows])
+    sweeps, selected, chosen = [], None, None
+    with gzip.open(directory / "cutoff_cluster_populations.csv.gz", "wt", newline="") as stream:
+        population_writer = csv.DictWriter(stream, fieldnames=["cutoff_A", "cluster_rank", "n_frames", "population_percent", "cumulative_percent"])
+        population_writer.writeheader()
+        for cutoff in args.cutoff_values:
+            clusters = gromos(points, cutoff)
+            sizes = [len(c["members"]) for c in clusters]
+            coverage = sum(sizes[:args.top_n]) / len(points)
+            passed = coverage >= args.target_coverage - 1e-12
+            cumulative = np.cumsum(sizes) / len(points)
+            count_to_target = int(np.searchsorted(cumulative, args.target_coverage - 1e-12) + 1)
+            population_writer.writerows({"cutoff_A": cutoff, "cluster_rank": rank,
+                "n_frames": size, "population_percent": 100 * size / len(points),
+                "cumulative_percent": 100 * cumulative[rank - 1]} for rank, size in enumerate(sizes, 1))
+            sweeps.append({"cutoff_A": cutoff, "n_observations": len(points), "n_clusters": len(clusters),
+                           "top_n": args.top_n, "top_n_available": min(args.top_n, len(clusters)),
+                           "top_n_fraction": coverage, "clusters_to_target": count_to_target,
+                           "target_fraction": args.target_coverage, "meets_target": passed})
+            log(f"  cutoff {cutoff:g} Å: {len(clusters)} clusters; top {args.top_n} = {coverage:.2%}")
+            if selected is None and passed:
+                selected, chosen = cutoff, clusters
+    write_csv(directory / "cutoff_sweep.csv", sweeps, list(sweeps[0]))
+    plot_sweep(sweeps, args.target_coverage, args.top_n, selected, directory / "cutoff_sweep", title)
+    if selected is None:
+        dump(directory / "group_summary.json", {"status": "no_cutoff_met_target", "n_observations": len(points),
+             "cutoffs_A": args.cutoff_values, "target_fraction": args.target_coverage, "top_n": args.top_n})
+        raise ValueError(f"{title}: no tested cutoff reaches target. Inspect cutoff_sweep.csv; "
+                         "extend the range explicitly and rerun with --overwrite.")
+    labels = np.zeros(len(points), dtype=int)
+    stats = []
+    for rank, cluster in enumerate(chosen, 1):
+        members = cluster["members"]
+        medoid = exact_medoid(points, members, args.medoid_block_size)
+        distances = np.linalg.norm(points[members] - points[medoid], axis=1)
+        labels[members] = rank
+        counts = Counter(rows[i]["trajectory_tag"] for i in members)
+        stats.append({"cluster": rank, "n_frames": len(members), "population_percent": 100 * len(members)/len(points),
+                      "medoid_observation_index0": medoid, "medoid_pdb": rows[medoid]["pdb_name"],
+                      "medoid_source_path": rows[medoid]["pdb_path"], "medoid_x_A": points[medoid, 0],
+                      "medoid_y_A": points[medoid, 1], "seed_observation_index0": cluster["seed"],
+                      "mean_distance_to_medoid_A": float(distances.mean()),
+                      "max_distance_to_medoid_A": float(distances.max()),
+                      "replica_counts_json": json.dumps(dict(sorted(counts.items()))),
+                      "representative_exported": args.export_clusters == 0 or rank <= args.export_clusters})
+    for row, label in zip(rows, labels):
+        row["cluster"] = int(label)
+        row["is_medoid"] = row["observation_index0"] == stats[label - 1]["medoid_observation_index0"]
+    write_csv(directory / "cluster_assignments.csv", rows, feature_columns + ["cluster", "is_medoid"])
+    write_csv(directory / "cluster_summary.csv", stats, list(stats[0]))
+    gate_names = ", ".join(AA[atom["reference_resname"]] + str(atom["resid"])
+                           for atom in selection["record"]["gate_atoms"])
+    y_label = "Reference RMSD: " + ("CB/CA" if selection["record"]["substitutions"] else "CB") + f" ({gate_names}) (Å)"
+    plot_clusters(points, labels, stats, args, directory, title, selected, y_label)
+    representatives = directory / "representatives"
+    representatives.mkdir()
+    for s in stats:
+        if not s["representative_exported"]:
+            continue
+        row = rows[s["medoid_observation_index0"]]
+        original = Path(row["pdb_path"])
+        if digest(original) != row["sha256"]:
+            raise ValueError(f"Input changed during analysis: {original}")
+        stem = f"cluster_{s['cluster']:03d}__{original.stem}"
+        original_output = representatives / f"{stem}_original.pdb"
+        aligned_output = representatives / f"{stem}_aligned.pdb"
+        shutil.copy2(original, original_output)
+        _, _, _, _, rotation, translation, pdb = calculate_features(original, selection, args)
+        pdb.write_aligned(aligned_output, rotation, translation,
+                          [f"GATE RMSD FEATURE CLUSTER {s['cluster']} MEDOID",
+                           f"SOURCE {original.name}", f"FEATURES_A {s['medoid_x_A']:.6f} {s['medoid_y_A']:.6f}"])
+        dump(representatives / f"{stem}.json", {"cluster_summary": s, "source": row,
+             "reference": str(args.reference), "reference_sha256": digest(args.reference),
+             "rotation_row_vector": rotation.tolist(), "translation_A": translation.tolist(),
+             "original_pdb": original_output.name, "aligned_pdb": aligned_output.name,
+             "selection": selection["record"]})
+    summary = {"status": "complete", "n_observations": len(points), "n_clusters": len(chosen),
+               "selected_cutoff_A": selected, "cutoff_selection": "smallest tested cutoff meeting target",
+               "top_n": args.top_n, "top_n_fraction": sum(s["n_frames"] for s in stats[:args.top_n])/len(points),
+               "target_fraction": args.target_coverage, "exported_clusters": sum(s["representative_exported"] for s in stats),
+               "small_sample_coverage_warning": small_sample,
+               "finite_input_export_caps": export_caps,
+               "population_denominator": "unique input PDB frames within this setup/species/state category",
+               "metric": selection["record"]["metric"], "medoid_metric": "same 2D Euclidean feature distance",
+               "warnings": ["Reference-RMSD descriptors can map different conformations to identical points.",
+                            "CB positions do not resolve full side-chain rotamers.",
+                            "Selected-frame proportions are not automatically equilibrium populations.",
+                            "The paper's 4 Å Cartesian RMSD cutoff is not transferable to this metric."]}
+    if small_sample:
+        summary["warnings"].append("Small sample: top-N coverage may meet target even with singleton clusters; this is not convergence.")
+    if export_caps:
+        summary["warnings"].append("Input extraction was capped; reported populations describe exported frames only.")
+    dump(directory / "group_summary.json", summary)
+    return summary
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--receptor", default="OR51E2")
+    p.add_argument("--input-root", type=Path, default=Path.home()/"OR51_gate"/"Gate_Clustering")
+    p.add_argument("--output-dir", type=Path, help="Default: INPUT_ROOT/clustering")
+    p.add_argument("--reference", type=Path, help="Default: INPUT_ROOT/reference/reference.pdb")
+    p.add_argument("--residue-table", type=Path, default=Path(__file__).resolve().parent/"OR51_residue_table.xlsx")
+    p.add_argument("--sheet", help="Workbook sheet name if receptor column is duplicated")
+    p.add_argument("--setups", nargs="+", help="Setup directory names; default: RECEPTOR_C3, RECEPTOR_C7, RECEPTOR_C3_vs_C7")
+    p.add_argument("--fit-segments", nargs="+", default=["TM1", "TM2", "TM3", "TM4"])
+    p.add_argument("--rmsd-segments", nargs="+", default=["TM5", "TM7"])
+    p.add_argument("--gate-generic", default="6x59", help="Generic-position row for the R262-equivalent residue")
+    p.add_argument("--gate-residues", nargs=3, type=int, metavar=("GATE1", "GATE2", "GATE3"))
+    p.add_argument("--chain", help="Receptor chain in candidates; auto-detected by required residue numbers")
+    p.add_argument("--reference-chain", help="Reference receptor chain; auto-detected independently")
+    p.add_argument("--missing-cb", choices=("error", "ca"), default="error", help="CA fallback is explicit and glycine-only")
+    p.add_argument("--allow-mutations", action="store_true", help="Allow selected residue identities to differ; numbering and atom presence stay strict")
+    p.add_argument("--cutoffs", nargs="+", type=float, help="Explicit positive feature-distance cutoffs in Å")
+    p.add_argument("--cutoff-min", type=float, default=.1)
+    p.add_argument("--cutoff-max", type=float, default=3.)
+    p.add_argument("--cutoff-step", type=float, default=.1)
+    p.add_argument("--top-n", type=int, default=6)
+    p.add_argument("--target-coverage", type=float, default=.5)
+    p.add_argument("--export-clusters", type=int, default=6, help="Top N medoids to export; 0 exports all. All clusters are assigned and summarized.")
+    p.add_argument("--medoid-block-size", type=int, default=512, help="Exact medoid calculation uses bounded square distance blocks")
+    p.add_argument("--dry-run", action="store_true", help="Validate table, reference, and every candidate PDB; write nothing")
+    p.add_argument("--overwrite", action="store_true", help="Replace only a previous output directory marked as belonging to this script")
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    args.receptor = args.receptor.upper()
+    args.fit_segments = [s.upper() for s in args.fit_segments]
+    args.rmsd_segments = [s.upper() for s in args.rmsd_segments]
+    args.input_root = args.input_root.expanduser().resolve()
+    args.output_dir = (args.output_dir or args.input_root/"clustering").expanduser().resolve()
+    args.reference = (args.reference or args.input_root/"reference"/"reference.pdb").expanduser().resolve()
+    args.residue_table = args.residue_table.expanduser().resolve()
+    if args.top_n < 1 or args.export_clusters < 0 or args.medoid_block_size < 1 or not 0 < args.target_coverage <= 1:
+        raise ValueError("Require top-n>=1, export-clusters>=0, medoid-block-size>=1, and 0<target-coverage<=1")
+    args.cutoff_values = cutoff_values(args)
+    if not args.input_root.is_dir():
+        raise FileNotFoundError(args.input_root)
+    if args.output_dir == args.input_root or args.output_dir in args.input_root.parents:
+        raise ValueError("Output directory must not equal or contain the input root")
+    if args.reference == args.output_dir or args.output_dir in args.reference.parents:
+        raise ValueError("Output directory must not contain the reference")
+    if args.residue_table == args.output_dir or args.output_dir in args.residue_table.parents:
+        raise ValueError("Output directory must not contain the residue table")
+    setups = args.setups or [args.receptor + suffix for suffix in ("_C3", "_C7", "_C3_vs_C7")]
+    if len(setups) != len(set(setups)):
+        raise ValueError("Duplicate --setups entries are not allowed")
+    groups = []
+    for setup in setups:
+        if Path(setup).name != setup or setup in (".", ".."):
+            raise ValueError(f"Setup must be a directory name: {setup}")
+        pool = args.input_root/setup/"PDBs_by_state"
+        if not pool.is_dir():
+            raise FileNotFoundError(f"Missing organized setup: {pool}. Run step 1, or specify --setups.")
+        if args.output_dir == pool or args.output_dir in pool.parents or pool in args.output_dir.parents:
+            raise ValueError("Output directory and pooled PDB directories must not overlap")
+        for species in ("C3", "C7"):
+            for state in STATES:
+                category = f"{species}_{state}"
+                directory = pool/category
+                if not directory.exists():
+                    # Pure-species setups need not carry absent-species folders.
+                    absent_species = (setup.endswith("_C3") and not setup.endswith("_C3_vs_C7") and species == "C7") or (setup.endswith("_C7") and not setup.endswith("_C3_vs_C7") and species == "C3")
+                    if not absent_species:
+                        groups.append((setup, category, [], None))
+                    continue
+                if not directory.is_dir():
+                    raise ValueError(f"Category is not a directory: {directory}")
+                paths = sorted(directory.glob("*.pdb"), key=lambda p: natural_key(p.name))
+                metadata = read_metadata(pool, category)
+                if (pool/"file_map.tsv").is_file() and set(metadata) != {p.name for p in paths}:
+                    missing = sorted(set(metadata) - {p.name for p in paths})
+                    unmapped = sorted({p.name for p in paths} - set(metadata))
+                    raise ValueError(f"PDB folder differs from file_map.tsv for {setup}/{category}; "
+                                     f"missing={missing[:5]}, unmapped={unmapped[:5]}. Reconcile inputs before clustering.")
+                groups.append((setup, category, paths, metadata))
+    if not groups or not any(g[2] for g in groups):
+        raise ValueError("No candidate PDBs found in the two requested gate categories")
+    selection = prepare_selection(args)
+    log(f"Receptor {args.receptor}: fit {len(selection['fit_keys'])} CA atoms; "
+        f"x {len(selection['measured_keys'])} CA atoms; y gate atoms {selection['gate_keys']}")
+    log("Clustering metric: 2D Euclidean feature distance in Å; no feature standardization.")
+    if args.dry_run:
+        for setup, category, paths, metadata in groups:
+            if metadata is None:
+                raise FileNotFoundError(f"Missing expected category: {args.input_root/setup/'PDBs_by_state'/category}")
+            feature_rows(paths, metadata, selection, args)
+            log(f"VALID {setup}/{category}: {len(paths)} PDBs")
+        log("Dry run passed. No files or folders were changed.")
+        return 0
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        marker = args.output_dir/"analysis_manifest.json"
+        if not args.overwrite:
+            raise FileExistsError(f"Output is not empty: {args.output_dir}. Use a new --output-dir or --overwrite.")
+        if not marker.is_file() or json.loads(marker.read_text()).get("script") != SCRIPT:
+            raise ValueError("Refusing --overwrite: output has no matching analysis_manifest.json")
+        shutil.rmtree(args.output_dir)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    manifest = {"script": SCRIPT, "version": VERSION, "status": "running",
+                "started_utc": datetime.now(timezone.utc).isoformat(), "config": config,
+                "reference_sha256": digest(args.reference), "residue_table_sha256": digest(args.residue_table),
+                "script_sha256": digest(__file__), "selections": selection["record"],
+                "software": {"python": platform.python_version(), "numpy": np.__version__,
+                             "scipy": scipy.__version__, "matplotlib": matplotlib.__version__, "openpyxl": openpyxl.__version__},
+                "method_provenance": "GROMOS-style algorithm; cutoff coverage inspired by Tertiary_Structure_SI Fig.16c/d. "
+                                     "This script uses 2D reference-RMSD features, unlike the paper's pairwise Cartesian RMSD.",
+                "groups": []}
+    dump(args.output_dir/"analysis_manifest.json", manifest)
+    dump(args.output_dir/"atom_selections.json", selection["record"])
+    failures = 0
+    for setup, category, paths, metadata in groups:
+        title = f"{setup} / {category}"
+        log(f"\n{title}: {len(paths)} frames")
+        status = {"setup": setup, "category": category, "n_observations": len(paths)}
+        if metadata is None:
+            failures += 1
+            status.update(status="missing_category", error="Expected category directory is absent; rerun organization or restore it.")
+            log(f"ERROR {title}: {status['error']}")
+        elif not paths:
+            status["status"] = "empty"
+        else:
+            try:
+                result = cluster_group(paths, metadata, selection, args, args.output_dir/setup/category, title)
+                status.update(result)
+            except Exception as exc:
+                failures += 1
+                status.update(status="failed", error=str(exc))
+                log(f"ERROR {title}: {exc}")
+        manifest["groups"].append(status)
+        dump(args.output_dir/"analysis_manifest.json", manifest)
+    manifest["status"] = "failed" if failures else "complete"
+    manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+    dump(args.output_dir/"analysis_manifest.json", manifest)
+    write_csv(args.output_dir/"run_summary.csv", manifest["groups"],
+              ["setup", "category", "status", "n_observations", "n_clusters", "selected_cutoff_A", "top_n_fraction", "exported_clusters", "error"])
+    log(f"\nFinished: {args.output_dir}; failed groups: {failures}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, FileNotFoundError, FileExistsError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2)

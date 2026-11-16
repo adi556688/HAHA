@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Pool replica PDBs for the two OR51 gate substates, preserving provenance.
+
+Requires Python >=3.9, standard library only. Sources are preserved. A row in
+file_map.tsv represents one receptor snapshot per category, not one ligand.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import csv
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+
+VERSION = "1.0.0"
+STATES = ("gate_entrance_capture", "gate_partial_insertion")
+CATEGORIES = tuple(f"{species}_{state}" for species in ("C3", "C7") for state in STATES)
+FIELDS = (
+    "setup", "trajectory_tag", "run_folder", "category", "original_pdb_path",
+    "organized_pdb_path", "frame0", "time_ps", "ligand_ids", "selected_ligand_rows",
+    "source_selected_frames_csv", "source_manifest_json", "export_cap",
+    "sha256", "storage_mode",
+)
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def safe_text(value):
+    value = str(value)
+    if any(c in value for c in "\t\r\n"):
+        raise ValueError(f"Tabs and newlines are not supported in paths/labels: {value!r}")
+    return value
+
+
+def read_json(path):
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def atomic_text(path, text):
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def pdb_metadata(path):
+    frame, time = None, ""
+    with path.open(encoding="ascii", errors="replace") as handle:
+        for line in handle:
+            if line.startswith(("ATOM  ", "HETATM")):
+                break
+            m = re.search(r"\bFRAME0\s+(\d+)", line)
+            if m:
+                frame = int(m.group(1))
+            m = re.search(r"\bTIME_PS\s+([-+\d.eE]+)", line)
+            if m:
+                time = m.group(1)
+    return frame, time
+
+
+def selected_metadata(path):
+    result = defaultdict(list)
+    if not path.is_file():
+        return result
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        required = {"category", "frame0", "pdb_path"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"Missing CSV columns {required}: {path}")
+        for row in reader:
+            if row["category"] in CATEGORIES:
+                key = (row["category"], Path(row["pdb_path"]).name)
+                result[key].append(row)
+    return result
+
+
+def prepare(args):
+    root, output = args.input_root, args.output_root
+    if not root.is_dir():
+        raise ValueError(f"Input root does not exist: {root}")
+    if output == root or root in output.parents or output in root.parents:
+        raise ValueError("Input and output roots must be separate, non-nested directories.")
+    plans, counts, run_metadata, notices = [], [], [], []
+    for setup in args.setups:
+        folder = root / setup
+        if not folder.is_dir():
+            raise ValueError(f"Missing setup: {folder}")
+        suffix = setup[len(args.receptor) + 1:]
+        if suffix not in ("C3", "C7", "C3_vs_C7"):
+            raise ValueError(f"Unsupported setup suffix: {setup}; expected C3, C7, or C3_vs_C7")
+        species = ("C3", "C7") if suffix == "C3_vs_C7" else (suffix,)
+        required_categories = {f"{s}_{state}" for s in species for state in STATES}
+        runs = {}
+        for candidate in sorted(folder.glob("run*")):
+            if not candidate.is_dir():
+                continue
+            match = re.fullmatch(r"run([1-9]\d*)(?:[-_].*)?", candidate.name)
+            if not match:
+                continue
+            number = int(match.group(1))
+            if number in runs:
+                raise ValueError(f"Multiple run{number} folders in {folder}")
+            runs[number] = candidate
+        if set(runs) != set(range(1, args.expected_runs + 1)):
+            raise ValueError(f"{setup}: found run numbers {sorted(runs)}; expected 1..{args.expected_runs}")
+        setup_counts = {cat: 0 for cat in CATEGORIES}
+        for number, run in sorted(runs.items()):
+            safe_text(run)
+            manifest_path, summary_path = run / "manifest.json", run / "summary.json"
+            manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+            summary = read_json(summary_path) if summary_path.is_file() else {}
+            if manifest and manifest.get("status") != "complete":
+                raise ValueError(f"Extraction is not complete: {manifest_path}")
+            cap = manifest.get("selection", {}).get("maximum_frames_per_category", "unknown")
+            if cap == "unknown":
+                notices.append(f"{setup}/{run.name}: export cap unknown; completeness cannot be established.")
+            elif int(cap) > 0:
+                notices.append(f"{setup}/{run.name}: extraction capped at {cap} frames/category; cluster fractions describe exported PDBs.")
+            csv_path = run / "selected_frames.csv"
+            selected = selected_metadata(csv_path)
+            if not csv_path.is_file():
+                notices.append(f"{setup}/{run.name}: no selected_frames.csv; ligand metadata unavailable.")
+            info = dict(setup=setup, run_folder=run.name, export_cap=cap,
+                        stride=manifest.get("stride", "unknown"), categories={})
+            for cat in CATEGORIES:
+                source_dir = run / "pdbs" / cat
+                if cat not in required_categories:
+                    if source_dir.is_dir() and any(source_dir.glob("*.pdb")):
+                        raise ValueError(f"Unexpected species PDBs in pure setup: {source_dir}")
+                    continue
+                if not source_dir.is_dir():
+                    raise ValueError(f"Missing required category directory: {source_dir}")
+                pdbs = sorted(source_dir.glob("*.pdb"))
+                reported = summary.get("categories", {}).get(cat, {})
+                if "exported_frames" in reported and int(reported["exported_frames"]) != len(pdbs):
+                    raise ValueError(f"{source_dir}: {len(pdbs)} PDBs but extraction summary reports {reported['exported_frames']}; check moved/missing files.")
+                info["categories"][cat] = dict(pdb_count=len(pdbs), **reported)
+                for source in pdbs:
+                    if not source.is_file():
+                        raise ValueError(f"Not a readable PDB file: {source}")
+                    safe_text(source)
+                    match = re.fullmatch(r"frame_(\d+)\.pdb", source.name)
+                    if not match:
+                        raise ValueError(f"Expected frame_NNN.pdb naming: {source}")
+                    frame0 = int(match.group(1))
+                    remark_frame, remark_time = pdb_metadata(source)
+                    if remark_frame is not None and remark_frame != frame0:
+                        raise ValueError(f"PDB filename/FRAME0 mismatch: {source}")
+                    rows = selected.get((cat, source.name), [])
+                    if csv_path.is_file() and not rows:
+                        raise ValueError(f"PDB absent from selected_frames.csv: {source}")
+                    if any(int(row["frame0"]) != frame0 for row in rows):
+                        raise ValueError(f"CSV/PDB frame mismatch: {source}")
+                    times = {row.get("time_ps", "") for row in rows} - {""}
+                    if len(times) > 1:
+                        raise ValueError(f"Inconsistent CSV times for {source}")
+                    time_ps = next(iter(times), remark_time)
+                    if time_ps and remark_time and abs(float(time_ps) - float(remark_time)) > 0.01:
+                        raise ValueError(f"CSV/PDB time mismatch: {source}")
+                    ligand_ids = sorted({row.get("ligand_id") or row.get(f"{cat[:2]}_ligand_id", "") for row in rows} - {""})
+                    relative = Path(setup) / "PDBs_by_state" / cat / f"traj{number}_{source.name}"
+                    target = output / relative
+                    sha = digest(source)
+                    storage = args.mode
+                    if target.exists() or target.is_symlink():
+                        if not target.is_file() or digest(target) != sha:
+                            raise ValueError(f"Existing destination differs or is unavailable; nothing copied: {target}")
+                        storage = "symlink" if target.is_symlink() else "copy"
+                    row = dict(setup=setup, trajectory_tag=f"traj{number}", run_folder=run.name,
+                               category=cat, original_pdb_path=str(source.relative_to(root)),
+                               organized_pdb_path=str(relative), frame0=str(frame0), time_ps=time_ps,
+                               ligand_ids=json.dumps(ligand_ids, separators=(",", ":")),
+                               selected_ligand_rows=str(len(rows)),
+                               source_selected_frames_csv=str(csv_path) if csv_path.is_file() else "",
+                               source_manifest_json=str(manifest_path) if manifest_path.is_file() else "",
+                               export_cap=str(cap), sha256=sha, storage_mode=storage)
+                    plans.append((source, target, row))
+                    setup_counts[cat] += 1
+            run_metadata.append(info)
+        counts.append(dict(setup=setup, categories=setup_counts))
+        # Step 3 discovers PDBs in these category directories. Refuse stray
+        # files, including files in normally empty categories, before copying.
+        planned_targets = {target for _, target, row in plans if row["setup"] == setup}
+        for category in CATEGORIES:
+            destination = output / setup / "PDBs_by_state" / category
+            if destination.exists() and not destination.is_dir():
+                raise ValueError(f"Category destination is not a directory: {destination}")
+            for existing in destination.glob("*.pdb"):
+                if existing not in planned_targets:
+                    raise ValueError(f"Unmapped PDB in output category: {existing}; use a fresh output root or remove the unintended file before organizing.")
+        map_path = output / setup / "PDBs_by_state" / "file_map.tsv"
+        if map_path.exists():
+            with map_path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                if tuple(reader.fieldnames or ()) != FIELDS:
+                    raise ValueError(f"Unexpected mapping schema: {map_path}")
+                old_rows = list(reader)
+            new_rows = {row["organized_pdb_path"]: row for _, _, row in plans if row["setup"] == setup}
+            if len({r["organized_pdb_path"] for r in old_rows}) != len(old_rows):
+                raise ValueError(f"Duplicate rows in {map_path}")
+            for old in old_rows:
+                if old["organized_pdb_path"] not in new_rows:
+                    raise ValueError(f"Previously organized source is now missing: {old['original_pdb_path']}; use a fresh output root for a different input set.")
+                new = new_rows[old["organized_pdb_path"]]
+                if any(old[k] != new[k] for k in ("original_pdb_path", "sha256", "frame0", "category")):
+                    raise ValueError(f"Existing mapping conflicts with current input: {map_path}")
+    if len({str(target) for _, target, _ in plans}) != len(plans):
+        raise ValueError("Duplicate output paths in transfer plan")
+    return plans, counts, run_metadata, notices
+
+
+def run(args):
+    plans, counts, run_metadata, notices = prepare(args)
+    for notice in notices:
+        print(f"WARNING: {notice}", file=sys.stderr)
+    print(f"Input: {args.input_root}\nOutput: {args.output_root}\nStorage: {args.mode}", flush=True)
+    for entry in counts:
+        for cat, n in entry["categories"].items():
+            print(f"{entry['setup']:24s} {cat:29s} {n:8d}")
+    reuse = sum(target.exists() for _, target, _ in plans)
+    print(f"Total: {len(plans)} snapshots; {reuse} matching destinations already present.", flush=True)
+    if args.dry_run:
+        print("Dry run passed. No files or folders changed.")
+        return
+    args.output_root.mkdir(parents=True, exist_ok=True)
+    lock_path = args.output_root / ".organizer.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise ValueError(f"Organizer lock exists: {lock_path}; do not run organizers concurrently. Remove a stale lock only after confirming its process stopped.") from exc
+    try:
+        with os.fdopen(lock_fd, "w") as handle:
+            handle.write(f"pid={os.getpid()}\n")
+        for setup in args.setups:
+            for category in CATEGORIES:
+                (args.output_root / setup / "PDBs_by_state" / category).mkdir(parents=True, exist_ok=True)
+        for source, target, row in plans:
+            if digest(source) != row["sha256"]:
+                raise ValueError(f"Source changed after preflight: {source}")
+            if target.exists() or target.is_symlink():
+                if not target.is_file() or digest(target) != row["sha256"]:
+                    raise ValueError(f"Destination changed after preflight: {target}")
+                continue
+            if args.mode == "symlink":
+                target.symlink_to(source.resolve())
+            else:
+                fd, temporary = tempfile.mkstemp(prefix=".copy.", dir=target.parent)
+                os.close(fd)
+                try:
+                    shutil.copy2(source, temporary)
+                    if digest(Path(temporary)) != row["sha256"]:
+                        raise ValueError(f"Copy verification failed: {source}")
+                    # Exclusive installation: os.link fails if another writer creates target.
+                    os.link(temporary, target)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+        import io
+        for setup in args.setups:
+            stream = io.StringIO(newline="")
+            writer = csv.DictWriter(stream, fieldnames=FIELDS, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(row for _, _, row in plans if row["setup"] == setup)
+            atomic_text(args.output_root / setup / "PDBs_by_state" / "file_map.tsv", stream.getvalue())
+        record = dict(script_version=VERSION, completed_utc=datetime.now(timezone.utc).isoformat(),
+                      input_root=str(args.input_root), output_root=str(args.output_root), receptor=args.receptor,
+                      mode=args.mode, expected_runs=args.expected_runs, counts=counts, runs=run_metadata,
+                      warnings=notices, organized_pdb_count=len(plans),
+                      mapping_paths="original_pdb_path relative to input_root; organized_pdb_path relative to output_root",
+                      counting="One PDB per trajectory/frame/category; multiple qualifying ligands do not duplicate receptor snapshots. Different categories can share frames. Cluster fractions are conditional on exported selected frames.")
+        atomic_text(args.output_root / "organize_manifest.json", json.dumps(record, indent=2) + "\n")
+    finally:
+        lock_path.unlink(missing_ok=True)
+    print("Finished. Replica labels and frame/ligand provenance are recorded in each file_map.tsv.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--input-root", type=Path, default=Path.home() / "OR51_gate" / "State_Snapshots_all")
+    parser.add_argument("--output-root", type=Path, default=Path.home() / "OR51_gate" / "Gate_Clustering")
+    parser.add_argument("--receptor", default="OR51E2", help="Receptor prefix used for setup discovery")
+    parser.add_argument("--setups", nargs="+", help="Exact setup names; default: receptor_C3, receptor_C7, receptor_C3_vs_C7")
+    parser.add_argument("--expected-runs", type=int, default=5)
+    parser.add_argument("--mode", choices=("copy", "symlink"), default="copy", help="Copy preserves independent PDBs; symlinks require original source files to remain available")
+    parser.add_argument("--dry-run", action="store_true", help="Validate all sources/collisions and report counts without writing")
+    args = parser.parse_args()
+    if args.expected_runs < 1:
+        parser.error("--expected-runs must be positive")
+    args.receptor = args.receptor.upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*", args.receptor):
+        parser.error("--receptor must be an alphanumeric receptor name such as OR51E2")
+    args.setups = args.setups or [f"{args.receptor}_{s}" for s in ("C3", "C7", "C3_vs_C7")]
+    if len(set(args.setups)) != len(args.setups) or any(not s.startswith(args.receptor + "_") or Path(s).name != s for s in args.setups):
+        parser.error("--setups must be unique, simple names beginning with receptor_")
+    args.input_root = args.input_root.expanduser().resolve()
+    args.output_root = args.output_root.expanduser().resolve()
+    safe_text(args.input_root)
+    safe_text(args.output_root)
+    run(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)

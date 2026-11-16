@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Save the protein from frame 0 of the C3 run-1 trajectory as reference.pdb.
+
+The first stored trajectory frame is used, which need not be simulation time
+zero. The original PDB's coordinates are NOT used as the reference. Requires
+MDTraj and NumPy. Coordinates are made whole by the topology's bonds unless
+--no-pbc is explicitly supplied for already-whole, nonperiodic input.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import sys
+import tempfile
+
+import mdtraj as md
+from mdtraj.formats import XTCTrajectoryFile
+import numpy as np
+
+VERSION = "1.0.0"
+HISTIDINES = {"HIS", "HSD", "HSE", "HSP", "HID", "HIE", "HIP"}
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-root", type=Path,
+                        default=Path.home() / "OR51_gate" / "Stripped_Trajs")
+    parser.add_argument("--output-root", type=Path,
+                        default=Path.home() / "OR51_gate" / "Gate_Clustering")
+    parser.add_argument("--receptor", default="OR51E2")
+    parser.add_argument("--trajectory", type=Path, help="Override the C3 run-1 XTC")
+    parser.add_argument("--topology", type=Path, help="Matching single-model PDB/GRO")
+    chain = parser.add_mutually_exclusive_group()
+    chain.add_argument("--chain", help="Protein chain identifier, e.g. A")
+    chain.add_argument("--chain-index", type=int, help="Zero-based topology chain index")
+    parser.add_argument("--no-pbc", action="store_true",
+                        help="Input protein is already whole; skip periodic reconstruction")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Replace an existing reference/provenance pair")
+    parser.add_argument("--dry-run", action="store_true", help="Validate without writing")
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.receptor):
+        parser.error("--receptor must contain only letters, numbers, _ or -")
+    if args.chain_index is not None and args.chain_index < 0:
+        parser.error("--chain-index must be nonnegative")
+    args.receptor = args.receptor.upper()
+    for field in ("input_root", "output_root", "trajectory", "topology"):
+        value = getattr(args, field)
+        if value is not None:
+            setattr(args, field, value.expanduser().resolve())
+    return args
+
+
+def resolve_sources(args):
+    setup = args.input_root / f"{args.receptor}_C3"
+    topology = args.topology or setup / "step5_input_nowater.pdb"
+    trajectory = args.trajectory
+    if trajectory is None:
+        matches = sorted(p for p in setup.glob("*.xtc")
+                         if re.fullmatch(r"run1(?:[-_].*)?\.xtc", p.name))
+        if len(matches) != 1:
+            raise ValueError(f"Expected one C3 run1 XTC in {setup}; found {len(matches)}. "
+                             "Set --trajectory explicitly.")
+        trajectory = matches[0]
+    for path in (topology, trajectory):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if trajectory.suffix.lower() != ".xtc":
+        raise ValueError("--trajectory must be an XTC; only its first frame is read")
+    return topology, trajectory
+
+
+def protein_chain(topology, args):
+    candidates = []
+    for chain in topology.chains:
+        if args.chain is not None and (chain.chain_id or "") != args.chain:
+            continue
+        if args.chain_index is not None and chain.index != args.chain_index:
+            continue
+        residues = [r for r in chain.residues if r.is_protein or r.name in HISTIDINES]
+        if residues:
+            candidates.append((chain, residues))
+    if len(candidates) != 1:
+        details = [(c.index, c.chain_id, len(r)) for c, r in candidates]
+        raise ValueError(f"Expected one protein-containing receptor chain; found {details}. "
+                         "Specify --chain or --chain-index when needed.")
+    chain, residues = candidates[0]
+    numbers = [r.resSeq for r in residues]
+    if len(set(numbers)) != len(numbers):
+        raise ValueError("Duplicate protein residue numbers; resolve insertion codes/numbering "
+                         "before residue-number-based fitting")
+    for residue in residues:
+        names = [a.name for a in residue.atoms]
+        if names.count("CA") != 1 or len(set(names)) != len(names):
+            raise ValueError(f"Expected unique atom names and one CA in {residue}")
+    return chain, residues
+
+
+def make_reference(args):
+    topology_path, trajectory_path = resolve_sources(args)
+    structure = md.load(str(topology_path))
+    if structure.n_frames != 1:
+        raise ValueError("Topology file must contain exactly one coordinate model")
+    chain, residues = protein_chain(structure.topology, args)
+    keep = np.asarray([a.index for r in residues for a in r.atoms], dtype=np.int32)
+    with XTCTrajectoryFile(str(trajectory_path), "r") as reader:
+        xyz, times, steps, boxes = reader.read(n_frames=1)
+    if len(xyz) != 1 or xyz.shape[1] != structure.n_atoms:
+        raise ValueError("XTC is empty or its atom count differs from the matching topology")
+    if not np.isfinite(xyz).all() or not np.isfinite(times).all():
+        raise ValueError("Nonfinite first-frame coordinates/time")
+    protein = md.Trajectory(xyz[:, keep], structure.topology.subset(keep), time=times)
+    source_fingerprint = hashlib.sha256()
+    for array in (xyz, times, steps, boxes):
+        if array is not None:
+            source_fingerprint.update(np.asarray(array).tobytes())
+    if not args.no_pbc:
+        if boxes is None or boxes.shape != (1, 3, 3) or not np.isfinite(boxes).all():
+            raise ValueError("Missing/invalid periodic box; --no-pbc requires already-whole input")
+        if np.linalg.det(boxes[0]) <= 1e-6:
+            raise ValueError("Periodic box is singular or has nonpositive volume")
+        protein.unitcell_vectors = boxes
+        molecules = protein.topology.find_molecules()
+        if len(molecules) != 1:
+            raise ValueError(f"Protein bonds define {len(molecules)} disconnected molecules. "
+                             "Repair bonds, or use --no-pbc only if already whole.")
+        bonds = np.asarray([(a.index, b.index) for a, b in protein.topology.bonds], dtype=np.int32)
+        before = md.compute_distances(protein, bonds, periodic=True)
+        protein.make_molecules_whole(inplace=True)
+        after = md.compute_distances(protein, bonds, periodic=False)
+        if not np.allclose(before, after, atol=0.002, rtol=0):
+            raise ValueError("Periodic reconstruction did not preserve protein bond lengths")
+    protein.unitcell_vectors = None
+    # A nonperiodic alignment reference has no meaningful simulation unit cell.
+    chain_id = chain.chain_id or ""
+    if len(chain_id) > 1:
+        raise ValueError("PDB export requires a one-character chain ID")
+    for serial, atom in enumerate(protein.topology.atoms, start=1):
+        atom.serial = serial
+    stat = trajectory_path.stat()
+    provenance = {
+        "script": Path(__file__).name, "script_version": VERSION,
+        "receptor": args.receptor, "setup": f"{args.receptor}_C3",
+        "topology": str(topology_path), "topology_sha256": sha256(topology_path),
+        "trajectory": str(trajectory_path), "trajectory_size_bytes": stat.st_size,
+        "trajectory_mtime_ns": stat.st_mtime_ns,
+        "trajectory_first_frame_sha256": source_fingerprint.hexdigest(),
+        "trajectory_hash_scope": "first decoded frame only; full XTC is not hashed",
+        "frame0": 0, "frame1": 1, "time_ps": float(times[0]), "step": int(steps[0]),
+        "source_chain_id": chain_id, "source_chain_index0": chain.index,
+        "output_chain_id": chain_id,
+        "protein_atoms": protein.n_atoms, "protein_residues": protein.n_residues,
+        "residue_numbers": [r.resSeq for r in protein.topology.residues],
+        "input_atom_indices0": keep.tolist(),
+        "pbc_reconstruction": not args.no_pbc,
+        "alignment_applied": False,
+        "python_version": platform.python_version(), "mdtraj_version": md.__version__,
+        "numpy_version": np.__version__,
+    }
+    return protein, provenance
+
+
+def save_reference(args, protein, provenance):
+    directory = args.output_root / "reference"
+    pdb = directory / "reference.pdb"
+    metadata = directory / "reference.json"
+    # Software versions do not invalidate an otherwise identical reference.
+    signature = {k: v for k, v in provenance.items()
+                 if k not in {"python_version", "mdtraj_version", "numpy_version",
+                              "input_signature_sha256", "reference_sha256"}}
+    provenance["input_signature_sha256"] = hashlib.sha256(
+        json.dumps(signature, sort_keys=True).encode()).hexdigest()
+    if pdb.exists() or metadata.exists():
+        if not args.overwrite:
+            if not pdb.is_file() or not metadata.is_file():
+                raise FileExistsError("Incomplete reference pair; inspect it and use --overwrite")
+            old = json.loads(metadata.read_text())
+            if (old.get("input_signature_sha256") == provenance["input_signature_sha256"]
+                    and old.get("reference_sha256") == sha256(pdb)):
+                print(f"Verified existing reference: {pdb}")
+                return
+            raise FileExistsError("Reference exists but inputs/options or output bytes differ; "
+                                  "use a different --output-root or explicit --overwrite")
+    print(f"Reference: frame 0, t={provenance['time_ps']:.6f} ps, "
+          f"{protein.n_atoms} protein atoms; chain {provenance['source_chain_id']!r}")
+    if args.dry_run:
+        print(f"Dry run passed; would write {pdb}. No files changed.")
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".reference-", dir=directory) as temporary:
+        pending = Path(temporary) / "reference.pdb"
+        protein.save_pdb(str(pending))
+        lines = pending.read_text().splitlines()
+        # MDTraj may assign A when the source chain is blank; preserve the source ID.
+        chain_field = provenance["source_chain_id"] or " "
+        lines = [(line[:21] + chain_field + line[22:])
+                 if line.startswith(("ATOM  ", "HETATM", "TER   ")) else line
+                 for line in lines if not line.startswith("CRYST1")]
+        records = [line for line in lines if line.startswith(("ATOM  ", "HETATM"))]
+        expected = [(atom.residue.resSeq, atom.name) for atom in protein.topology.atoms]
+        observed = [(int(line[22:26]), line[12:16].strip()) for line in records]
+        if observed != expected:
+            raise ValueError("PDB export changed atom identities or residue numbers")
+        remarks = ["REMARK 900 FIRST STORED C3 RUN-1 TRAJECTORY FRAME; PROTEIN ONLY",
+                   f"REMARK 900 FRAME0 0 TIME_PS {provenance['time_ps']:.6f}",
+                   "REMARK 900 SOURCE AND ATOM MAPPING: reference.json"]
+        pending.write_text("\n".join(remarks + lines) + "\n")
+        provenance["reference_sha256"] = sha256(pending)
+        json_pending = Path(temporary) / "reference.json"
+        json_pending.write_text(json.dumps(provenance, indent=2, allow_nan=False) + "\n")
+        os.replace(pending, pdb)
+        os.replace(json_pending, metadata)
+    print(f"Saved {pdb}")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    protein, provenance = make_reference(args)
+    save_reference(args, protein, provenance)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, FileNotFoundError, FileExistsError, OSError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+# Run from any directory; the three Python scripts and table stay beside this file.
+set -Eeuo pipefail
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+OR51_PROJECT="${OR51_GATE_DIR:-$HOME/OR51_gate}"
+OR51_PYTHON_BIN="${OR51_PYTHON:-$HOME/venvs/or_gate_py311/bin/python}"
+STATE_ROOT="$OR51_PROJECT/State_Snapshots_all"
+TRAJ_ROOT="$OR51_PROJECT/Stripped_Trajs"
+WORK_ROOT="$OR51_PROJECT/Gate_Clustering"
+TABLE="$SCRIPT_DIR/OR51_residue_table.xlsx"
+RECEPTOR=OR51E2
+EXPECTED_RUNS=5
+STEPS=1,2,3
+DRY=0
+TRAJECTORY=''
+TOPOLOGY=''
+CLUSTER_ARGS=()
+usage() {
+    cat <<'USAGE'
+Usage: bash run_gate_clustering.sh [options] [-- clustering-options]
+  --state-root PATH      Extractor output (default ~/OR51_gate/State_Snapshots_all)
+  --traj-root PATH       Original stripped trajectories (default ~/OR51_gate/Stripped_Trajs)
+  --work-root PATH       New pooled/reference/clustering tree (default ~/OR51_gate/Gate_Clustering)
+  --residue-table PATH   XLSX (default OR51_residue_table.xlsx beside this launcher)
+  --receptor NAME        Default OR51E2; e.g. OR51E1 for matching inputs
+  --expected-runs N      Default 5; organizer validates replica directories
+  --python PATH         Python executable (default ~/venvs/or_gate_py311/bin/python)
+  --trajectory PATH     Override C3 run1 XTC for reference extraction
+  --topology PATH       Override matching PDB topology for reference extraction
+  --steps 1,2,3          Run selected steps, in that order (default all)
+  --dry-run             Validate without creating outputs
+  --help                Show this help
+Arguments following -- are sent only to script 3, e.g. --cutoff-max 5.0.
+An initial dry-run checks source pooling/reference inputs. Clustering validation
+is deferred until pooled PDBs and reference exist; then --steps 3 --dry-run
+checks every structure. Normal execution runs all three steps sequentially.
+USAGE
+}
+while (($#)); do
+    case "$1" in
+        --state-root|--traj-root|--work-root|--residue-table|--receptor|--expected-runs|--python|--trajectory|--topology|--steps)
+            (($# >= 2)) || die "Missing value for $1"
+            case "$1" in
+                --state-root) STATE_ROOT=$2;;
+                --traj-root) TRAJ_ROOT=$2;;
+                --work-root) WORK_ROOT=$2;;
+                --residue-table) TABLE=$2;;
+                --receptor) RECEPTOR=$2;;
+                --expected-runs) EXPECTED_RUNS=$2;;
+                --python) OR51_PYTHON_BIN=$2;;
+                --trajectory) TRAJECTORY=$2;;
+                --topology) TOPOLOGY=$2;;
+                --steps) STEPS=$2;;
+            esac
+            shift 2;;
+        --dry-run) DRY=1; shift;;
+        --help|-h) usage; exit 0;;
+        --) shift; CLUSTER_ARGS=("$@"); break;;
+        *) die "Unknown launcher option: $1 (use -- before script-3 options)";;
+    esac
+done
+[[ "$STEPS" =~ ^[123](,[123])*$ ]] || die '--steps must contain comma-separated 1, 2, and/or 3'
+[[ "$EXPECTED_RUNS" =~ ^[1-9][0-9]*$ ]] || die '--expected-runs must be positive'
+command -v "$OR51_PYTHON_BIN" >/dev/null 2>&1 || die "Python is unavailable on $(hostname): $OR51_PYTHON_BIN. Use --python with a working environment on this node."
+export OMP_NUM_THREADS="${OR51_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OR51_THREADS:-1}"
+export MKL_NUM_THREADS="${OR51_THREADS:-1}"
+export PYTHONUNBUFFERED=1
+export MPLBACKEND=Agg
+printf 'Host: %s\nPython: %s\nReceptor: %s\nOutput: %s\n' "$(hostname)" "$OR51_PYTHON_BIN" "$RECEPTOR" "$WORK_ROOT"
+"$OR51_PYTHON_BIN" - "$STEPS" <<'PY'
+import importlib, sys
+steps = set(sys.argv[1].split(','))
+modules = set()
+if '2' in steps:
+    modules.update(['mdtraj', 'numpy'])
+if '3' in steps:
+    modules.update(['numpy', 'scipy', 'matplotlib', 'openpyxl'])
+print('Python', sys.version.split()[0])
+for name in sorted(modules):
+    try:
+        module = importlib.import_module(name)
+    except ImportError as error:
+        raise SystemExit(f'Missing dependency {name}: {error}. See README environment setup.')
+    print(name, getattr(module, '__version__', 'available'))
+PY
+DRY_ARGS=()
+((DRY == 0)) || DRY_ARGS=(--dry-run)
+IFS=, read -r -a ORDER <<< "$STEPS"
+for step in "${ORDER[@]}"; do
+    case "$step" in
+        1)
+            "$OR51_PYTHON_BIN" -u "$SCRIPT_DIR/01_organize_gate_pdbs.py" --input-root "$STATE_ROOT" --output-root "$WORK_ROOT" --receptor "$RECEPTOR" --expected-runs "$EXPECTED_RUNS" "${DRY_ARGS[@]}"
+            ;;
+        2)
+            REFERENCE_ARGS=()
+            [[ -z "$TRAJECTORY" ]] || REFERENCE_ARGS+=(--trajectory "$TRAJECTORY")
+            [[ -z "$TOPOLOGY" ]] || REFERENCE_ARGS+=(--topology "$TOPOLOGY")
+            "$OR51_PYTHON_BIN" -u "$SCRIPT_DIR/02_make_reference.py" --input-root "$TRAJ_ROOT" --output-root "$WORK_ROOT" --receptor "$RECEPTOR" "${REFERENCE_ARGS[@]}" "${DRY_ARGS[@]}"
+            ;;
+        3)
+            [[ -f "$TABLE" ]] || die "Residue table not found: $TABLE"
+            if ((DRY)) && [[ ! -f "$WORK_ROOT/reference/reference.pdb" ]]; then
+                printf 'Step 3 validation deferred: reference/pooled outputs do not exist yet. Run steps 1,2, then --steps 3 --dry-run.\n'
+                continue
+            fi
+            "$OR51_PYTHON_BIN" -u "$SCRIPT_DIR/03_cluster_gate_rmsd.py" --input-root "$WORK_ROOT" --receptor "$RECEPTOR" --residue-table "$TABLE" "${CLUSTER_ARGS[@]}" "${DRY_ARGS[@]}"
+            ;;
+    esac
+done
+printf 'Requested steps completed%s.\n' "$([[ "$DRY" == 1 ]] && printf ' (dry run)' || true)"
