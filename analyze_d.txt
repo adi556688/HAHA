@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+from decimal import Decimal, InvalidOperation
+import re
+import sys
+
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")  # Works over SSH and without a display.
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from rdkit import Chem
+
+
+# --------------------------- EDIT THESE SETTINGS ---------------------------
+REFERENCE_CSV = ""
+SUBFOLDERS = [
+    "",
+
+]
+SCORE_COLUMN = ""
+OUTPUT_FOLDER = ""
+LOW_COUNT_THRESHOLD = 5  # Flag n < 5; this is not a statistical cutoff.
+CSV_SEPARATOR = ","      # Use ";" if your exported CSVs use semicolons.
+CSV_ENCODING = "utf-8-sig"
+# --------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def normalize_cid(value):
+    """Match integer IDs, including Excel forms such as 8892.0 or 8.892E3."""
+    text = str(value).strip()
+    if not re.fullmatch(r"\+?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", text):
+        return ""
+    try:
+        number = Decimal(text)
+        if number.is_finite() and number > 0 and number == number.to_integral_value():
+            return str(int(number))
+    except (InvalidOperation, ValueError, OverflowError):
+        pass
+    return ""
+
+
+def read_csv(path, required):
+    """Read identifiers as text and preserve labels such as 'NA' in Activity."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Expected CSV not found: {path}")
+    df = pd.read_csv(path, dtype=str, keep_default_na=False,
+                     sep=CSV_SEPARATOR, encoding=CSV_ENCODING)
+    df.columns = df.columns.str.strip()
+    if df.columns.duplicated().any():
+        raise ValueError(f"Duplicate column names in {path.name}.")
+    missing = set(required) - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{path}: missing columns {sorted(missing)}.\n"
+            f"Available columns: {list(df.columns)}\n"
+            "Check the CSV separator and SCORE_COLUMN. Score columns are not substituted."
+        )
+    return df
+
+
+def count_heavy_atoms(smile):
+    """Count atoms with atomic number > 1 across all supplied SMILES fragments."""
+    if not smile.strip():
+        return np.nan, "missing_smile"
+    mol = Chem.MolFromSmiles(smile.strip())
+    if mol is None:
+        return np.nan, "invalid_smile"
+    if any(atom.GetAtomicNum() == 0 for atom in mol.GetAtoms()):
+        return np.nan, "contains_dummy_atoms"
+    n = mol.GetNumHeavyAtoms()
+    if n == 0:
+        return np.nan, "no_heavy_atoms"
+    status = "ok_multiple_fragments" if len(Chem.GetMolFrags(mol)) > 1 else "ok"
+    return n, status
+
+
+def load_reference():
+    ref = read_csv(BASE_DIR / REFERENCE_CSV, ["PubChemCID", "SMILE", "Activity"])
+    if ref.empty:
+        raise ValueError("The reference CSV has no molecules.")
+    ref["PubChemCID"] = ref["PubChemCID"].map(normalize_cid)
+    if (ref["PubChemCID"] == "").any():
+        rows = (ref.index[ref["PubChemCID"] == ""] + 2).tolist()
+        raise ValueError(f"Missing or invalid reference PubChemCID at CSV rows {rows}.")
+    duplicates = ref.loc[ref["PubChemCID"].duplicated(), "PubChemCID"].tolist()
+    if duplicates:
+        raise ValueError(f"Reference PubChemCID must be unique; duplicates: {duplicates}")
+    counts = [count_heavy_atoms(s) for s in ref["SMILE"]]
+    ref["heavy_atoms"] = pd.array([n for n, _ in counts], dtype="Int64")
+    ref["smile_status"] = [status for _, status in counts]
+    return ref
+
+
+def load_scores(ref):
+    """Keep every matched, finite score row; retain provenance for auditing."""
+    paths = [BASE_DIR / folder / f"{Path(folder).name}.csv" for folder in SUBFOLDERS]
+    if not paths or len({p.resolve() for p in paths}) != len(paths):
+        raise ValueError("SUBFOLDERS must contain at least one folder, without duplicates.")
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        raise FileNotFoundError("Expected CSV files not found:\n" + "\n".join(missing))
+    tables, reports = [], []
+    known_cids = set(ref["PubChemCID"])
+    invalid_counts = pd.Series(0, index=ref["PubChemCID"], dtype=int)
+    for folder, path in zip(SUBFOLDERS, paths):
+        df = read_csv(path, ["title", SCORE_COLUMN])
+        cid = df["title"].map(normalize_cid)
+        score = pd.to_numeric(df[SCORE_COLUMN], errors="coerce")
+        matched = cid.isin(known_cids)
+        finite = np.isfinite(score)
+        keep = matched & finite
+        bad = cid[matched & ~finite].value_counts()
+        invalid_counts = invalid_counts.add(bad, fill_value=0).astype(int)
+        tables.append(pd.DataFrame({
+            "PubChemCID": cid[keep], "folder": folder,
+            "csv_row": df.index[keep] + 2, "title": df.loc[keep, "title"],
+            "score_column": SCORE_COLUMN, "score": score[keep],
+        }))
+        report = {
+            "folder": folder, "csv_file": str(path), "score_column": SCORE_COLUMN,
+            "n_rows": len(df), "n_kept_scores": int(keep.sum()),
+            "n_invalid_titles": int((cid == "").sum()),
+            "n_unknown_cid_rows": int(((cid != "") & ~matched).sum()),
+            "n_invalid_scores_for_reference": int((matched & ~finite).sum()),
+            "unmatched_titles": "; ".join(sorted(set(df.loc[~matched, "title"]))),
+        }
+        reports.append(report)
+        print(f"{folder}: kept {int(keep.sum())}/{len(df)} rows")
+        if (~keep).any():
+            print("  Some rows were excluded; see input_report.csv.", file=sys.stderr)
+    scores = pd.concat(tables, ignore_index=True)
+    scores = scores.merge(ref[["PubChemCID", "SMILE", "Activity", "heavy_atoms"]],
+                          on="PubChemCID", how="left", validate="many_to_one")
+    scores["score_per_heavy_atom"] = scores["score"] / scores["heavy_atoms"].astype(float)
+    return scores, pd.DataFrame(reports), invalid_counts
+
+
+def statistics(values, prefix):
+    """Linear-interpolated quartiles; an empty set produces blank CSV fields."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    names = ["min", "q1", "median", "mean", "q3"]
+    if len(values) == 0:
+        result = [np.nan] * 5
+    else:
+        q1, median, q3 = np.quantile(values, [0.25, 0.5, 0.75], method="linear")
+        result = [values.min(), q1, median, values.mean(), q3]
+    return {f"{prefix}_{name}": value for name, value in zip(names, result)}
+
+
+def draw_distribution(ax, values, label, empty_message):
+    """An empirical CDF works even for one score or repeated identical scores."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    ax.set_xlabel(label)
+    ax.set_ylabel("Fraction of scores at or below x")
+    ax.set_ylim(-0.03, 1.05)
+    ax.grid(alpha=0.2)
+    if len(values) == 0:
+        ax.text(0.5, 0.5, empty_message, ha="center", va="center",
+                transform=ax.transAxes)
+        return
+    x, counts = np.unique(values, return_counts=True)
+    y = np.cumsum(counts) / len(values)
+    pad = max((x[-1] - x[0]) * 0.06, abs(x[0]) * 0.02, 0.02)
+    ax.step(np.r_[x[0] - pad, x, x[-1] + pad], np.r_[0, y, 1],
+            where="post", color="#24738b", linewidth=1.8)
+    ax.scatter(x, y, s=16, color="#24738b", zorder=3)
+    ax.plot(values, np.full(len(values), 0.02), "|", color="#24738b", alpha=0.4)
+    ax.axvline(np.median(values), color="#bf673b", linestyle="--", label="Median")
+    ax.legend(frameon=False, loc="lower right")
+
+
+def main():
+    if not isinstance(LOW_COUNT_THRESHOLD, int) or LOW_COUNT_THRESHOLD < 2:
+        raise ValueError("LOW_COUNT_THRESHOLD must be an integer >= 2.")
+    ref = load_reference()
+    scores, report, invalid_counts = load_scores(ref)
+    output = BASE_DIR / OUTPUT_FOLDER
+    output.mkdir(parents=True, exist_ok=True)
+    groups = dict(tuple(scores.groupby("PubChemCID", sort=False)))
+    records = []
+    with PdfPages(output / "docking_distributions.pdf") as pdf:
+        for _, molecule in ref.iterrows():
+            cid = molecule["PubChemCID"]
+            group = groups.get(cid, scores.iloc[:0])
+            raw = group["score"].to_numpy(dtype=float)
+            scaled = group["score_per_heavy_atom"].to_numpy(dtype=float)
+            n = len(raw)
+            status = ("no_results" if n == 0 else "single_result" if n == 1 else
+                      "few_results" if n < LOW_COUNT_THRESHOLD else "available")
+            record = molecule.to_dict()  # Preserve names, Activity and other reference metadata.
+            record.update({
+                "score_column": SCORE_COLUMN, "n_scores": n,
+                "n_normalized_scores": int(np.isfinite(scaled).sum()),
+                "n_folders_with_scores": group["folder"].nunique(),
+                "n_folders_requested": len(SUBFOLDERS),
+                "n_invalid_scores": int(invalid_counts[cid]), "data_status": status,
+            })
+            record.update(statistics(raw, "score"))
+            record.update(statistics(scaled, "score_per_heavy_atom"))
+            records.append(record)
+
+            fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.5), constrained_layout=True)
+            title = (f"PubChemCID {cid} | Activity: {molecule['Activity']}\n"
+                     f"n = {n}; folders = {record['n_folders_with_scores']}/{len(SUBFOLDERS)}; "
+                     f"{status}; heavy atoms = {molecule['heavy_atoms']}")
+            fig.suptitle(title, fontsize=11)
+            draw_distribution(axes[0], raw, SCORE_COLUMN, "No valid docking scores")
+            message = ("No valid docking scores" if n == 0 else
+                       f"Normalization unavailable\n{molecule['smile_status']}")
+            draw_distribution(axes[1], scaled, "Docking score / heavy atom", message)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    summary = pd.DataFrame(records)
+    summary["heavy_atoms"] = pd.array(summary["heavy_atoms"], dtype="Int64")
+    for frame, name in [(summary, "docking_summary.csv"), (scores, "docking_scores_long.csv"),
+                        (report, "input_report.csv")]:
+        frame.to_csv(output / name, index=False, encoding="utf-8-sig", na_rep="")
+    print(f"\nSaved {len(ref)} molecules and {len(scores)} valid scores to {output}")
+    print("Molecule counts:", summary["data_status"].value_counts().to_dict())
+    if (summary["n_scores"] == 0).all():
+        print("WARNING: no reference molecule has a valid score. Check titles and input_report.csv.")
+    if summary["heavy_atoms"].isna().any():
+        print("WARNING: some molecules could not be normalized; check smile_status.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        sys.exit(f"ERROR: {exc}")
