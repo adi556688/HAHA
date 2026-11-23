@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.text import Text
+
+DPI = 300
+GROUPS = {"R": "#0072B2", "NR": "#D55E00", "SB": "#009E73"}
+STATISTICS = ["min", "q1", "median", "mean", "q3"]
+plt.rcParams.update({
+    "font.weight": "bold", "font.size": 12,
+    "axes.labelweight": "bold", "axes.titleweight": "bold",
+    "axes.linewidth": 1.8, "xtick.major.width": 1.8, "ytick.major.width": 1.8,
+    "xtick.minor.width": 1.8, "ytick.minor.width": 1.8,
+    "xtick.major.size": 6, "ytick.major.size": 6,
+})
+
+
+def plot_groups(ax, table, column, ylabel, kind):
+    labels = table["Activity"].astype(str).str.strip().str.upper()
+    values = pd.to_numeric(table[column], errors="coerce")
+    ticks = []
+    for position, (group, color) in enumerate(GROUPS.items(), start=1):
+        x = values[(labels == group) & np.isfinite(values)].to_numpy(dtype=float)
+        ticks.append(f"{group}\n(n={len(x)})")
+        if not len(x):
+            continue
+        if kind == "violin":
+            if len(x) < 2 or np.ptp(x) == 0:
+                ax.hlines(x[0], position - 0.3, position + 0.3,
+                          color=color, linewidth=2)
+            else:
+                parts = ax.violinplot(x, positions=[position], widths=0.65,
+                                      showmeans=False, showmedians=True, showextrema=True)
+                for body in parts["bodies"]:
+                    body.set_facecolor(color)
+                    body.set_edgecolor(color)
+                    body.set_alpha(0.65)
+                    body.set_linewidth(1.8)
+                for key in ["cmins", "cmaxes", "cbars", "cmedians"]:
+                    parts[key].set_color("black" if key == "cmedians" else color)
+                    parts[key].set_linewidth(1.8)
+        else:
+            ax.boxplot(x, positions=[position], widths=0.6, manage_ticks=False,
+                       whis=(0, 100), showfliers=False, patch_artist=True,
+                       boxprops={"facecolor": color, "edgecolor": color,
+                                 "alpha": 0.65, "linewidth": 1.8},
+                       whiskerprops={"color": color, "linewidth": 1.8},
+                       capprops={"color": color, "linewidth": 1.8},
+                       medianprops={"color": "black", "linewidth": 2})
+    ax.set_xticks(range(1, len(GROUPS) + 1), ticks)
+    ax.set_xlim(0.5, len(GROUPS) + 0.5)
+    ax.set_ylabel(ylabel)
+    ax.grid(axis="y", alpha=0.2)
+    ax.set_axisbelow(True)
+    if not (np.isfinite(values) & labels.isin(GROUPS)).any():
+        ax.text(0.5, 0.5, "No valid values", ha="center", transform=ax.transAxes)
+        ax.set_yticks([])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("input_dir", type=Path,
+                        help="Folder containing docking_scores_long.csv and docking_summary.csv")
+    args = parser.parse_args()
+    input_dir = args.input_dir.expanduser().resolve()
+    output_dir = input_dir / "plots"
+    tables = []
+    for filename in ["docking_scores_long.csv", "docking_summary.csv"]:
+        path = input_dir / filename
+        if not path.is_file():
+            parser.error(f"CSV not found: {path}")
+        table = pd.read_csv(path, keep_default_na=False)
+        labels = table["Activity"].astype(str).str.strip().str.upper()
+        unknown = sorted(set(labels) - set(GROUPS))
+        if unknown:
+            print(f"{filename}: skipping Activity labels outside R/NR/SB: {unknown}")
+        tables.append(table)
+    scores, summary = tables
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plots = [("pooled_scores", scores, "", "violin")]
+    plots += [(stat, summary, f"_{stat}", "box") for stat in STATISTICS]
+    with PdfPages(output_dir / "R_NR_SB_comparisons.pdf") as pdf:
+        for name, table, suffix, kind in plots:
+            fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.5), constrained_layout=True)
+            plot_groups(axes[0], table, "score" + suffix, "GScore (kcal/mol)", kind)
+            plot_groups(axes[1], table, "score_per_heavy_atom" + suffix,
+                        "GScore / # of heavy atoms (kcal/mol)", kind)
+            fig.canvas.draw()
+            for text in fig.findobj(match=Text):
+                text.set_fontweight("bold")
+            pdf.savefig(fig)
+            fig.savefig(output_dir / f"{name}.png", dpi=DPI)
+            plt.close(fig)
+    print(f"Saved 6 comparison figures as PDF and PNGs in {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
