@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+INPUT_DIR = Path(__file__).resolve().parent  # Folder containing the two CSVs.
+OUTPUT_DIR = INPUT_DIR / "plots"
+DPI = 300
+GROUPS = {"R": "#0072B2", "NR": "#D55E00", "SB": "#009E73"}
+STATISTICS = ["min", "q1", "median", "mean", "q3"]
+
+
+def plot_groups(ax, table, column, xlabel, unit):
+    labels = table["Activity"].astype(str).str.strip().str.upper()
+    values = pd.to_numeric(table[column], errors="coerce")
+    ticks = []
+    for position, (group, color) in enumerate(GROUPS.items(), start=1):
+        x = values[(labels == group) & np.isfinite(values)].to_numpy()
+        ticks.append(f"{group}\n(n={len(x)})")
+        if len(x):
+            ax.boxplot(x, positions=[position], widths=0.6, manage_ticks=False,
+                       whis=(0, 100), showfliers=False, patch_artist=True,
+                       boxprops={"facecolor": color, "edgecolor": color, "alpha": 0.6},
+                       whiskerprops={"color": color}, capprops={"color": color},
+                       medianprops={"color": "black", "linewidth": 1.5})
+    ax.set_xticks(range(1, len(GROUPS) + 1), ticks)
+    ax.set_xlim(0.5, len(GROUPS) + 0.5)
+    ax.set_xlabel(f"Activity (n = {unit})")
+    ax.set_ylabel(xlabel)
+    ax.grid(axis="y", alpha=0.2)
+    ax.set_axisbelow(True)
+    if not (np.isfinite(values) & labels.isin(GROUPS)).any():
+        ax.text(0.5, 0.5, "No valid values", ha="center", transform=ax.transAxes)
+        ax.set_yticks([])
+
+def main():
+    scores = pd.read_csv(INPUT_DIR / "docking_scores_long.csv", keep_default_na=False)
+    summary = pd.read_csv(INPUT_DIR / "docking_summary.csv", keep_default_na=False)
+    for name, table in [("docking_scores_long.csv", scores), ("docking_summary.csv", summary)]:
+        labels = table["Activity"].astype(str).str.strip().str.upper()
+        unknown = sorted(set(labels) - set(GROUPS))
+        if unknown:
+            print(f"{name}: skipping Activity labels outside R/NR/SB: {unknown}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    plots = [("pooled_scores", scores, "", "Pooled scores", "poses")]
+    plots += [(stat, summary, f"_{stat}", f"Per-molecule {stat}", "molecules")
+              for stat in STATISTICS]
+    with PdfPages(OUTPUT_DIR / "R_NR_SB_comparisons.pdf") as pdf:
+        for name, table, suffix, title, unit in plots:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
+            fig.suptitle(f"{title} — R / NR / SB (one observation per {unit[:-1]})\n"
+                         "Box: Q1–Q3; line: median; whiskers: minimum–maximum")
+            plot_groups(axes[0], table, "score" + suffix, "Docking score", unit)
+            plot_groups(axes[1], table, "score_per_heavy_atom" + suffix,
+                        "Docking score / heavy atom", unit)
+            axes[0].set_title("Raw scores")
+            axes[1].set_title("Heavy-atom-normalized scores")
+            pdf.savefig(fig)
+            fig.savefig(OUTPUT_DIR / f"{name}.png", dpi=DPI)
+            plt.close(fig)
+    print(f"Saved 6 comparison figures as PDF and PNGs in {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
